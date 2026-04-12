@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 
 using namespace std::chrono_literals;
 
@@ -50,8 +51,8 @@ void Lwp3Gt4::setupNotifications() {
         porsche.notify(SERVICE_UUID, CHAR_UUID, [this](SimpleBLE::ByteArray data) {
             auto* raw = (uint8_t*)data.data();
             if (data.size() >= 8 && raw[2] == 0x45 && raw[3] == PORT_STEER) {
-                rawSteerPos = *(int32_t*)(&raw[4]);
-                telemetryActive = true;
+                rawSteerPos.store(*(int32_t*)(&raw[4]));
+                telemetryActive.store(true);
                 if (onSteerUpdate) onSteerUpdate(rawSteerPos.load() - hardwareCenter);
             }
         });
@@ -104,8 +105,8 @@ int32_t Lwp3Gt4::sweep_to_limit(int8_t speed, uint8_t power, const std::string& 
 
 void Lwp3Gt4::autoCalibrate() {
     std::cout << "[SDK] Waiting for telemetry..." << std::endl;
-    for(int i=0; i<30 && !telemetryActive; i++) std::this_thread::sleep_for(100ms);
-    if (!telemetryActive) return;
+    for(int i=0; i<30 && !telemetryActive.load(); i++) std::this_thread::sleep_for(100ms);
+    if (!telemetryActive.load()) return;
 
     int32_t initialRawPos = rawSteerPos.load();
     hardwareCenter = initialRawPos; 
