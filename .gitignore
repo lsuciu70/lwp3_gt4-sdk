@@ -4,3 +4,4 @@ build/
 # IDE files
 .vscode/
 .cache/
+.aider*
