@@ -11,51 +11,40 @@
 using namespace std::chrono_literals;
 
 int main(int argc, char* argv[]) {
-    Lwp3Gt4 car;
+    LWP3::PorscheGt4 car;
     
-    // Check if user provided a custom MAC address as CLI argument
+    // Provide your car's MAC address via CLI or use a local variable
     std::string mac = "28:3C:90:9C:82:14"; 
     if (argc > 1) mac = argv[1];
 
-    std::cout << "--- LWP3-GT4-SDK Professional Test Suite ---" << std::endl;
-
     try {
-        // Register telemetry callbacks
+        // 1. Register Telemetry Callbacks (Simple Lambdas)
         car.onBatteryUpdate = [](uint8_t level) {
-            std::cout << "\n[Hub] Battery Status: " << (int)level << "%" << std::endl;
+            std::cout << "Battery: " << (int)level << "%" << std::endl;
         };
 
-        car.onButtonUpdate = [](bool pressed) {
-            std::cout << "\n[Hub] Physical Button: " << (pressed ? "DOWN" : "UP") << std::endl;
+        car.onSteerUpdate = [](int32_t pos) {
+            std::cout << "\rSteering Position: " << pos << "°    " << std::flush;
         };
 
-        car.onRssiUpdate = [](int8_t rssi) {
-            std::cout << "[Hub] Signal Strength: " << (int)rssi << " dBm" << std::endl;
-        };
+        // 2. Connect to the Hub
+        if (car.connect(mac)) {
+            
+            // 3. Perform automatic calibration
+            car.autoCalibrate();
 
-        car.onSteerUpdate = [](int32_t rel_pos) {
-            std::cout << "\r[Tele] Wheel Angle: " << rel_pos << "°    " << std::flush;
-        };
+            // 4. Command Movement
+            car.setSteer(20);  // Turn 20 degrees right
+            car.setDrive(50);  // 50% power forward
+            
+            std::this_thread::sleep_for(2s);
 
-        // Initialize connection and mechanical alignment
-        car.connect(mac);
-        car.autoCalibrate();
-
-        std::cout << "\n[Main] Sequence active. Press Car Button to test callback, or wait 10s..." << std::endl;
-        
-        // Monitoring loop
-        for(int i = 0; i < 10; i++) {
-            std::this_thread::sleep_for(1s);
-            std::cout << "." << std::flush;
+            // 5. Cleanup
+            car.stop();
+            car.disconnect();
         }
-
-        // Graceful exit
-        car.disconnect();
-        std::cout << "\n[Main] Test finished. Car disconnected safely." << std::endl;
-
     } catch (const std::exception& e) {
-        std::cerr << "\n[FATAL] Exception: " << e.what() << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
     }
-
     return 0;
 }
