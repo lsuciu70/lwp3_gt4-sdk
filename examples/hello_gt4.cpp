@@ -1,37 +1,60 @@
+/**
+ * @file hello_gt4.cpp
+ * @brief Demonstration of the LWP3-GT4-SDK capabilities.
+ */
+
 #include "Lwp3Gt4.hpp"
 #include <iostream>
 #include <thread>
 
-int main() {
+// Enable time literals for clean duration syntax
+using namespace std::chrono_literals;
+
+int main(int argc, char* argv[]) {
     Lwp3Gt4 car;
-    std::cout << "--- LWP3-GT4-SDK Test Suite ---" << std::endl;
+    
+    // Check if user provided a custom MAC address as CLI argument
+    std::string mac = "28:3C:90:9C:82:14"; 
+    if (argc > 1) mac = argv[1];
+
+    std::cout << "--- LWP3-GT4-SDK Professional Test Suite ---" << std::endl;
 
     try {
-        // This will now block and wait for you to press the button on the car
-        car.connect();
-
-        car.onSteerUpdate = [](int32_t rel_pos) {
-            std::cout << "\r[Tele] Relative: " << rel_pos << "°    " << std::flush;
+        // Register telemetry callbacks
+        car.onBatteryUpdate = [](uint8_t level) {
+            std::cout << "\n[Hub] Battery Status: " << (int)level << "%" << std::endl;
         };
 
+        car.onButtonUpdate = [](bool pressed) {
+            std::cout << "\n[Hub] Physical Button: " << (pressed ? "DOWN" : "UP") << std::endl;
+        };
+
+        car.onRssiUpdate = [](int8_t rssi) {
+            std::cout << "[Hub] Signal Strength: " << (int)rssi << " dBm" << std::endl;
+        };
+
+        car.onSteerUpdate = [](int32_t rel_pos) {
+            std::cout << "\r[Tele] Wheel Angle: " << rel_pos << "°    " << std::flush;
+        };
+
+        // Initialize connection and mechanical alignment
+        car.connect(mac);
         car.autoCalibrate();
 
-        std::cout << "\n[Main] Testing boundaries..." << std::endl;
+        std::cout << "\n[Main] Sequence active. Press Car Button to test callback, or wait 10s..." << std::endl;
         
-        car.setSteer(car.getMinSteer());
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // Monitoring loop
+        for(int i = 0; i < 10; i++) {
+            std::this_thread::sleep_for(1s);
+            std::cout << "." << std::flush;
+        }
 
-        car.setSteer(car.getMaxSteer());
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-
-        car.setSteer(0);
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-
+        // Graceful exit
         car.disconnect();
-        std::cout << "[Main] Complete. Porsche is safe." << std::endl;
+        std::cout << "\n[Main] Test finished. Car disconnected safely." << std::endl;
 
     } catch (const std::exception& e) {
-        std::cerr << "Fatal Error: " << e.what() << std::endl;
+        std::cerr << "\n[FATAL] Exception: " << e.what() << std::endl;
     }
 
     return 0;
