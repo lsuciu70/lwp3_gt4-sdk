@@ -1,15 +1,17 @@
 /**
  * @file Lwp3Gt4.cpp
- * @brief Implementation of the PorscheGt4 control logic.
+ * @brief Implementation of the PorscheGt4 C++20 SDK.
  */
 
 #include "Lwp3Gt4.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <iostream>
+#include <ranges>
 #include <thread>
-#include <vector>
 
 #include "Lwp3Constants.hpp"
 
@@ -22,7 +24,10 @@ PorscheGt4::~PorscheGt4() {
     disconnect();
 }
 
-bool PorscheGt4::connect(const std::string& address) {
+/**
+ * @brief Blocking connection loop using C++20 Ranges.
+ */
+bool PorscheGt4::connect(std::string_view address) {
     while (true) {
         auto adapters = SimpleBLE::Adapter::get_adapters();
         if (adapters.empty()) {
@@ -36,118 +41,175 @@ bool PorscheGt4::connect(const std::string& address) {
         adapter.scan_for(1000);
         auto results = adapter.scan_get_results();
 
-        for (auto& p : results) {
-            if (p.address() == address) {
-                porsche = p;
-                std::cout << "\n[SDK] Hub detected! Connecting..." << std::endl;
-                try {
-                    porsche.connect();
-                    std::this_thread::sleep_for(1500ms);
-                    setupNotifications();
+        auto it = std::ranges::find_if(results, [&](auto& p) { return p.address() == address; });
 
-                    sendRaw({LEN_VIRTUAL_PORT_SETUP, 0x00, VIRTUAL_PORT_SETUP, 0x01, PORT_DRIVE_L,
-                             PORT_DRIVE_R});
-                    sendRaw({LEN_HUB_PROP_SETUP, 0x00, HUB_PROPERTIES, BATTERY_VOLTAGE,
-                             ENABLE_UPDATES});
-                    sendRaw(
-                        {LEN_HUB_PROP_SETUP, 0x00, HUB_PROPERTIES, BUTTON_STATE, ENABLE_UPDATES});
-                    sendRaw({LEN_HUB_PROP_SETUP, 0x00, HUB_PROPERTIES, RSSI, ENABLE_UPDATES});
+        if (it != results.end()) {
+            porsche = *it;
+            std::cout << "\n[SDK] Hub detected! Connecting..." << std::endl;
+            try {
+                porsche.connect();
+                std::this_thread::sleep_for(1500ms);
+                setupNotifications();
 
-                    return true;
-                } catch (...) {
-                    std::cerr << "\n[SDK] Connection failed. Retrying..." << std::endl;
-                }
+                // Note: Virtual Port ID 20 causes one motor to reverse if not internally
+                // inverted. We handle this by sending individual packets for L/R in setDrive.
+
+                auto enable_prop = [&](HubProperty prop) {
+                    sendRaw({static_cast<uint8_t>(MessageLength::HUB_PROP_SETUP), 0x00,
+                             static_cast<uint8_t>(MessageType::HUB_PROPERTIES),
+                             static_cast<uint8_t>(prop),
+                             static_cast<uint8_t>(HubPropertyOperation::ENABLE_UPDATES)});
+                };
+
+                enable_prop(HubProperty::BATTERY_VOLTAGE);
+                enable_prop(HubProperty::BUTTON_STATE);
+                enable_prop(HubProperty::RSSI);
+
+                return true;
+            } catch (const std::exception& e) {
+                std::cerr << "\n[SDK] Connection error: " << e.what() << std::endl;
             }
         }
         std::this_thread::sleep_for(500ms);
     }
 }
 
+/**
+ * @brief Internal notification handler. Uses std::memcpy for UB-safe telemetry parsing.
+ */
 void PorscheGt4::setupNotifications() {
     try {
-        porsche.notify(SERVICE_UUID, CHAR_UUID, [this](SimpleBLE::ByteArray data) {
-            auto* raw = (uint8_t*)data.data();
+        porsche.notify(SERVICE_UUID.data(), CHAR_UUID.data(), [this](SimpleBLE::ByteArray data) {
+            const auto* raw = reinterpret_cast<const uint8_t*>(data.data());
             if (data.size() < 3) return;
 
-            switch (raw[2]) {
-                case PORT_VALUE_SINGLE:
+            const auto msgType = static_cast<MessageType>(raw[2]);
+
+            switch (msgType) {
+                case MessageType::PORT_VALUE_SINGLE:
                     if (raw[3] == PORT_STEER) {
-                        rawSteerPos.store(*(int32_t*)(&raw[4]));
+                        int32_t pos = 0;
+                        std::memcpy(&pos, &raw[4], sizeof(int32_t));
+                        rawSteerPos.store(pos);
                         telemetryActive.store(true);
-                        if (onSteerUpdate) onSteerUpdate(rawSteerPos.load() - hardwareCenter);
+                        cv_movement.notify_all();
+                        if (onSteerUpdate) onSteerUpdate(pos - hardwareCenter);
                     }
                     break;
 
-                case HUB_PROPERTIES:
-                    if (raw[4] != UPDATE) break;
-                    if (raw[3] == BATTERY_VOLTAGE) {
+                case MessageType::HUB_PROPERTIES: {
+                    const auto prop = static_cast<HubProperty>(raw[3]);
+                    if (static_cast<HubPropertyOperation>(raw[4]) != HubPropertyOperation::UPDATE)
+                        break;
+
+                    if (prop == HubProperty::BATTERY_VOLTAGE) {
                         batteryLevel.store(raw[5]);
-                        if (onBatteryUpdate) onBatteryUpdate(batteryLevel.load());
-                    } else if (raw[3] == BUTTON_STATE) {
-                        buttonPressed.store(raw[5] == 0x01);
-                        if (onButtonUpdate) onButtonUpdate(buttonPressed.load());
-                    } else if (raw[3] == RSSI) {
-                        rssiValue.store((int8_t)raw[5]);
-                        if (onRssiUpdate) onRssiUpdate(rssiValue.load());
+                        if (onBatteryUpdate) onBatteryUpdate(raw[5]);
+                    } else if (prop == HubProperty::BUTTON_STATE) {
+                        bool pressed = (raw[5] == 0x01);
+                        buttonPressed.store(pressed);
+                        if (onButtonUpdate) onButtonUpdate(pressed);
+                    } else if (prop == HubProperty::RSSI) {
+                        int8_t rssi = static_cast<int8_t>(raw[5]);
+                        rssiValue.store(rssi);
+                        if (onRssiUpdate) onRssiUpdate(rssi);
                     }
                     break;
-
-                case HUB_ATTACHED_IO:
-                    if (raw[4] == 0x02) {
-                        if (raw[7] == PORT_DRIVE_L && raw[8] == PORT_DRIVE_R) {
-                            virtualDrivePort.store(raw[3]);
-                        }
-                    }
+                }
+                default:
                     break;
             }
         });
-        sendRaw({LEN_PORT_INPUT_FORMAT, 0x00, PORT_INPUT_FORMAT_SETUP, PORT_STEER, 0x02, 0x01, 0x00,
-                 0x00, 0x00, 0x01});
+
+        sendRaw({static_cast<uint8_t>(MessageLength::PORT_INPUT_FORMAT), 0x00,
+                 static_cast<uint8_t>(MessageType::PORT_INPUT_FORMAT_SETUP), PORT_STEER, 0x02, 0x01,
+                 0x00, 0x00, 0x00, 0x01});
     } catch (...) {
     }
 }
 
+/**
+ * @brief Corrected Drive Logic: Inverts the Left motor to account for mirrored physical mounting.
+ */
+void PorscheGt4::setDrive(int8_t speed) {
+    // We send individual packets to ensure perfect control over sign inversion
+    setDrive(speed, speed);
+}
+
+/**
+ * @brief Differential Drive Implementation with physical orientation compensation.
+ */
+void PorscheGt4::setDrive(int8_t leftSpeed, int8_t rightSpeed) {
+    auto drive = [&](uint8_t port, int8_t s, bool invert) {
+        int final_speed = std::clamp(static_cast<int>(s), -100, 100);
+        if (invert) final_speed *= -1;  // Compensate for physical orientation
+
+        uint8_t val = static_cast<uint8_t>(final_speed);
+        sendRaw({static_cast<uint8_t>(MessageLength::MOTOR_POWER), 0x00,
+                 static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND), port, 0x11,
+                 static_cast<uint8_t>(PortOutputSubCommand::START_POWER), val, 0x64, 0x03});
+    };
+
+    // Rear Left is physically inverted in the GT4 chassis
+    drive(PORT_DRIVE_L, leftSpeed, true);
+    drive(PORT_DRIVE_R, rightSpeed, false);
+}
+
+void PorscheGt4::setSteerRaw(int32_t absolute_angle, uint8_t speed) {
+    std::array<uint8_t, 14> buffer = {static_cast<uint8_t>(MessageLength::GOTO_ABS_POS),
+                                      0x00,
+                                      static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND),
+                                      PORT_STEER,
+                                      0x11,
+                                      static_cast<uint8_t>(PortOutputSubCommand::GOTO_ABS_POS)};
+    std::memcpy(&buffer[6], &absolute_angle, sizeof(int32_t));
+    buffer[10] = speed;
+    buffer[11] = 0x64;
+    buffer[12] = 0x7E;
+    buffer[13] = 0x03;
+    sendRaw(SimpleBLE::ByteArray(reinterpret_cast<const char*>(buffer.data()), buffer.size()));
+}
+
 bool PorscheGt4::autoCalibrate() {
-    // 1. Wait for telemetry link
-    for (int i = 0; i < 30 && !telemetryActive.load(); i++) std::this_thread::sleep_for(100ms);
+    if (!telemetryActive.load()) {
+        for (int i = 0; i < 30 && !telemetryActive.load(); i++) std::this_thread::sleep_for(100ms);
+    }
     if (!telemetryActive.load()) return false;
 
-    int32_t initialRawPos = rawSteerPos.load();
+    const int32_t initialRawPos = rawSteerPos.load();
     hardwareCenter = initialRawPos;
 
-    // 2. Perform End-to-End Sweeps
-    int32_t rawLeft = sweep_to_limit(-30, 40, "LEFT");
+    const int32_t rawLeft = sweep_to_limit(-30, 40, "LEFT");
     std::this_thread::sleep_for(500ms);
-
     setSteerRaw(initialRawPos, 50);
     waitForMovement(initialRawPos, 3, 4000);
     std::this_thread::sleep_for(500ms);
+    const int32_t rawRight = sweep_to_limit(30, 40, "RIGHT");
 
-    int32_t rawRight = sweep_to_limit(30, 40, "RIGHT");
+    const int32_t totalTravel = std::abs(rawLeft - rawRight);
+    if (totalTravel < 80) return false;
 
-    // 3. Range Validation (Sanity Check)
-    // The GT4 rack should have a minimum of ~100 degrees total travel
-    int32_t totalTravel = std::abs(rawLeft - rawRight);
-    if (totalTravel < 80) {
-        std::cerr << "[SDK] Calibration Failure: Insufficient travel range (" << totalTravel << "°)"
-                  << std::endl;
-        return false;
-    }
-
-    // 4. Finalize Centering
-    int32_t newCenter = (rawLeft + rawRight) / 2;
-    minRelative.store(std::min(rawLeft, rawRight) - newCenter);
-    maxRelative.store(std::max(rawLeft, rawRight) - newCenter);
-    hardwareCenter = newCenter;
+    hardwareCenter = (rawLeft + rawRight) / 2;
+    minRelative.store(std::min(rawLeft, rawRight) - hardwareCenter);
+    maxRelative.store(std::max(rawLeft, rawRight) - hardwareCenter);
 
     setSteer(0);
     waitForMovement(hardwareCenter, 1, 3000);
     return true;
 }
 
-int32_t PorscheGt4::sweep_to_limit(int8_t speed, uint8_t power, const std::string& label) {
-    sendRaw({LEN_MOTOR_POWER, 0x00, PORT_OUTPUT_COMMAND, PORT_STEER, 0x11, START_POWER,
-             (uint8_t)speed, power, 0x03});
+void PorscheGt4::waitForMovement(int32_t target_absolute, int32_t tolerance, int timeout_ms) {
+    std::unique_lock<std::mutex> lock(mtx_movement);
+    cv_movement.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+        return std::abs(rawSteerPos.load() - target_absolute) <= tolerance;
+    });
+}
+
+int32_t PorscheGt4::sweep_to_limit(int8_t speed, uint8_t power, std::string_view label) {
+    sendRaw({static_cast<uint8_t>(MessageLength::MOTOR_POWER), 0x00,
+             static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND), PORT_STEER, 0x11,
+             static_cast<uint8_t>(PortOutputSubCommand::START_POWER), static_cast<uint8_t>(speed),
+             power, 0x03});
     std::this_thread::sleep_for(600ms);
     int32_t last_pos = rawSteerPos.load();
     int stuck_count = 0;
@@ -161,48 +223,8 @@ int32_t PorscheGt4::sweep_to_limit(int8_t speed, uint8_t power, const std::strin
         if (stuck_count >= 4) break;
         last_pos = p;
     }
-    sendRaw({LEN_MOTOR_POWER, 0x00, PORT_OUTPUT_COMMAND, PORT_STEER, 0x11, START_POWER, 0x00, 0x64,
-             0x03});
-    std::this_thread::sleep_for(300ms);
+    stop();
     return rawSteerPos.load();
-}
-
-void PorscheGt4::setDrive(int8_t speed) {
-    uint8_t v_port = virtualDrivePort.load();
-    if (v_port != 0xFF) {
-        int8_t clamped = std::clamp(speed, (int8_t)-100, (int8_t)100);
-        sendRaw({LEN_MOTOR_POWER, 0x00, PORT_OUTPUT_COMMAND, v_port, 0x11, START_POWER,
-                 (uint8_t)clamped, 0x64, 0x03});
-    } else {
-        setDrive(speed, speed);
-    }
-}
-
-void PorscheGt4::setDrive(int8_t leftSpeed, int8_t rightSpeed) {
-    int8_t cL = std::clamp(leftSpeed, (int8_t)-100, (int8_t)100);
-    int8_t cR = std::clamp(rightSpeed, (int8_t)-100, (int8_t)100);
-    sendRaw({LEN_MOTOR_POWER, 0x00, PORT_OUTPUT_COMMAND, PORT_DRIVE_L, 0x11, START_POWER,
-             (uint8_t)cL, 0x64, 0x03});
-    sendRaw({LEN_MOTOR_POWER, 0x00, PORT_OUTPUT_COMMAND, PORT_DRIVE_R, 0x11, START_POWER,
-             (uint8_t)cR, 0x64, 0x03});
-}
-
-void PorscheGt4::setSteerRaw(int32_t absolute_angle, uint8_t speed) {
-    std::vector<uint8_t> cmd = {LEN_GOTO_ABS_POS, 0x00, PORT_OUTPUT_COMMAND,
-                                PORT_STEER,       0x11, GOTO_ABS_POS};
-    uint8_t* p = (uint8_t*)&absolute_angle;
-    for (int i = 0; i < 4; i++) cmd.push_back(p[i]);
-    cmd.insert(cmd.end(), {speed, 0x64, 0x7E, 0x03});
-    sendRaw(SimpleBLE::ByteArray((const char*)cmd.data(), cmd.size()));
-}
-
-void PorscheGt4::waitForMovement(int32_t target_absolute, int32_t tolerance, int timeout_ms) {
-    int elapsed = 0;
-    while (elapsed < timeout_ms) {
-        if (std::abs(rawSteerPos.load() - target_absolute) <= tolerance) return;
-        std::this_thread::sleep_for(100ms);
-        elapsed += 100;
-    }
 }
 
 void PorscheGt4::setSteer(int32_t relative_angle) {
@@ -212,14 +234,15 @@ void PorscheGt4::setSteer(int32_t relative_angle) {
 
 void PorscheGt4::stop() {
     setDrive(0, 0);
-    sendRaw({LEN_MOTOR_POWER, 0x00, PORT_OUTPUT_COMMAND, PORT_STEER, 0x11, START_POWER, 0x00, 0x64,
-             0x03});
+    sendRaw({static_cast<uint8_t>(MessageLength::MOTOR_POWER), 0x00,
+             static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND), PORT_STEER, 0x11,
+             static_cast<uint8_t>(PortOutputSubCommand::START_POWER), 0x00, 0x64, 0x03});
 }
 
-void PorscheGt4::sendRaw(SimpleBLE::ByteArray data) {
+void PorscheGt4::sendRaw(const SimpleBLE::ByteArray& data) {
     if (!porsche.is_connected()) return;
     try {
-        porsche.write_request(SERVICE_UUID, CHAR_UUID, data);
+        porsche.write_request(SERVICE_UUID.data(), CHAR_UUID.data(), data);
     } catch (...) {
     }
 }
@@ -234,18 +257,6 @@ void PorscheGt4::disconnect() {
 
 bool PorscheGt4::isConnected() {
     return porsche.is_connected();
-}
-uint8_t PorscheGt4::getBatteryLevel() const {
-    return batteryLevel.load();
-}
-bool PorscheGt4::isButtonPressed() const {
-    return buttonPressed.load();
-}
-int32_t PorscheGt4::getMinSteer() const {
-    return minRelative.load();
-}
-int32_t PorscheGt4::getMaxSteer() const {
-    return maxRelative.load();
 }
 
 }  // namespace LWP3

@@ -1,80 +1,85 @@
 /**
  * @file Lwp3Gt4.hpp
  * @author lsuciu
- * @brief Public Interface for the PorscheGt4 Controller.
+ * @brief Public Interface for the PorscheGt4 C++20 SDK.
  */
 
 #pragma once
 #include <simpleble/SimpleBLE.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
+#include <string_view>
 
 namespace LWP3 {
 
 /**
  * @class PorscheGt4
- * @brief High-level controller for the LEGO Technic Porsche GT4 (42176).
+ * @brief Advanced controller for the LEGO Technic Porsche GT4 (42176).
+ * Now updated to C++20 standards with improved safety and performance.
  */
 class PorscheGt4 {
    public:
     // --- Callbacks ---
-
-    /** @brief Callback for steering updates (Returns degrees relative to 0). */
     std::function<void(int32_t)> onSteerUpdate;
-
-    /** @brief Callback for battery updates (Returns percentage 0-100). */
     std::function<void(uint8_t)> onBatteryUpdate;
-
-    /** @brief Callback for physical Hub button events. */
     std::function<void(bool)> onButtonUpdate;
-
-    /** @brief Callback for signal strength updates (Returns dBm). */
     std::function<void(int8_t)> onRssiUpdate;
 
     PorscheGt4();
     ~PorscheGt4();
 
     /**
-     * @brief Scans and connects to the vehicle hub using a specific MAC address.
-     * @param address Bluetooth MAC address.
-     * @return True if connection and LWP3 handshake succeed.
+     * @brief Connects to the hub using C++20 string_view for zero-allocation literals.
+     * @param address The MAC address of the Hub.
+     * @return True if successful.
      */
-    bool connect(const std::string& address);
+    bool connect(std::string_view address);
 
-    /** @brief Disconnects and stops all hardware safely. */
+    /** @brief Safely shuts down motors and disconnects. */
     void disconnect();
 
     /**
-     * @brief Performs mechanical homing to find steering limits.
-     * @return True if calibration succeeded and a valid range was found.
+     * @brief Performs mechanical calibration.
+     * @return True if a valid range was discovered.
      */
     bool autoCalibrate();
 
-    /** @brief Sets steering position. Range determined by calibration. */
+    /** @brief Sets steering relative to center. */
     void setSteer(int32_t relative_angle);
 
-    /** @brief Sets drive speed using synchronized Virtual Port. */
+    /** @brief Sets drive speed for the synchronized Virtual Port. */
     void setDrive(int8_t speed);
 
-    /** @brief Sets individual drive speeds for differential maneuvers. */
+    /** @brief Independent rear motor control. */
     void setDrive(int8_t leftSpeed, int8_t rightSpeed);
 
-    /** @brief Stops all drive and steering motors immediately. */
+    /** @brief Immediate halt of all actuators. */
     void stop();
 
-    // --- State Getters ---
-    uint8_t getBatteryLevel() const;
-    bool isButtonPressed() const;
-    int32_t getMinSteer() const;
-    int32_t getMaxSteer() const;
+    // --- Getters ---
+    uint8_t getBatteryLevel() const {
+        return batteryLevel.load();
+    }
+    bool isButtonPressed() const {
+        return buttonPressed.load();
+    }
+    int32_t getMinSteer() const {
+        return minRelative.load();
+    }
+    int32_t getMaxSteer() const {
+        return maxRelative.load();
+    }
     bool isConnected();
 
    private:
     SimpleBLE::Peripheral porsche;
 
+    // --- Thread-Safe State ---
     std::atomic<int32_t> rawSteerPos{0};
     std::atomic<uint8_t> batteryLevel{0};
     std::atomic<bool> buttonPressed{false};
@@ -82,14 +87,26 @@ class PorscheGt4 {
     std::atomic<bool> telemetryActive{false};
     std::atomic<uint8_t> virtualDrivePort{0xFF};
 
+    // --- Synchronization (C++20 Design) ---
+    std::mutex mtx_movement;
+    std::condition_variable cv_movement;
+
     int32_t hardwareCenter = 0;
     std::atomic<int32_t> minRelative{-60};
     std::atomic<int32_t> maxRelative{60};
 
+    // --- Internal Protocol Logic ---
     void setupNotifications();
-    void sendRaw(SimpleBLE::ByteArray data);
+
+    /** @brief Sends raw data using const reference to avoid unnecessary copies. */
+    void sendRaw(const SimpleBLE::ByteArray& data);
+
+    /** @brief Move to position using stack-allocated buffers (no heap). */
     void setSteerRaw(int32_t absolute_angle, uint8_t speed = 40);
-    int32_t sweep_to_limit(int8_t speed, uint8_t power, const std::string& label);
+
+    int32_t sweep_to_limit(int8_t speed, uint8_t power, std::string_view label);
+
+    /** @brief Smart wait using condition variables instead of busy-sleep. */
     void waitForMovement(int32_t target_absolute, int32_t tolerance = 2, int timeout_ms = 3000);
 };
 }  // namespace LWP3
