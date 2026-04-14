@@ -10,7 +10,6 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
-#include <ranges>
 #include <thread>
 
 #include "Lwp3Constants.hpp"
@@ -25,7 +24,7 @@ PorscheGt4::~PorscheGt4() {
 }
 
 /**
- * @brief Blocking connection loop using C++20 Ranges.
+ * @brief Scans for the specific peripheral using C++20 ranges.
  */
 bool PorscheGt4::connect(std::string_view address) {
     while (true) {
@@ -41,6 +40,7 @@ bool PorscheGt4::connect(std::string_view address) {
         adapter.scan_for(1000);
         auto results = adapter.scan_get_results();
 
+        // Range-based search with non-const lambda to satisfy SimpleBLE's API
         auto it = std::ranges::find_if(results, [&](auto& p) { return p.address() == address; });
 
         if (it != results.end()) {
@@ -51,9 +51,7 @@ bool PorscheGt4::connect(std::string_view address) {
                 std::this_thread::sleep_for(1500ms);
                 setupNotifications();
 
-                // Note: Virtual Port ID 20 causes one motor to reverse if not internally
-                // inverted. We handle this by sending individual packets for L/R in setDrive.
-
+                // Enable Telemetry updates
                 auto enable_prop = [&](HubProperty prop) {
                     sendRaw({static_cast<uint8_t>(MessageLength::HUB_PROP_SETUP), 0x00,
                              static_cast<uint8_t>(MessageType::HUB_PROPERTIES),
@@ -67,7 +65,8 @@ bool PorscheGt4::connect(std::string_view address) {
 
                 return true;
             } catch (const std::exception& e) {
-                std::cerr << "\n[SDK] Connection error: " << e.what() << std::endl;
+                std::cerr << "\n[SDK] Handshake error: " << e.what() << ". Retrying..."
+                          << std::endl;
             }
         }
         std::this_thread::sleep_for(500ms);
@@ -75,7 +74,7 @@ bool PorscheGt4::connect(std::string_view address) {
 }
 
 /**
- * @brief Internal notification handler. Uses std::memcpy for UB-safe telemetry parsing.
+ * @brief Processes incoming LWP3 notifications. Uses std::memcpy for aliasing safety.
  */
 void PorscheGt4::setupNotifications() {
     try {
@@ -89,10 +88,14 @@ void PorscheGt4::setupNotifications() {
                 case MessageType::PORT_VALUE_SINGLE:
                     if (raw[3] == PORT_STEER) {
                         int32_t pos = 0;
+                        // Use std::memcpy to avoid Strict Aliasing UB and Alignment issues
                         std::memcpy(&pos, &raw[4], sizeof(int32_t));
                         rawSteerPos.store(pos);
                         telemetryActive.store(true);
+
+                        // Wake up blocking threads (calibration/homing)
                         cv_movement.notify_all();
+
                         if (onSteerUpdate) onSteerUpdate(pos - hardwareCenter);
                     }
                     break;
@@ -121,23 +124,25 @@ void PorscheGt4::setupNotifications() {
             }
         });
 
+        // Subscription for steering motor telemetry
         sendRaw({static_cast<uint8_t>(MessageLength::PORT_INPUT_FORMAT), 0x00,
                  static_cast<uint8_t>(MessageType::PORT_INPUT_FORMAT_SETUP), PORT_STEER, 0x02, 0x01,
                  0x00, 0x00, 0x00, 0x01});
-    } catch (...) {
+    } catch (const std::exception& e) {
+        std::cerr << "[SDK] Notification link error: " << e.what() << std::endl;
     }
 }
 
 /**
- * @brief Corrected Drive Logic: Inverts the Left motor to account for mirrored physical mounting.
+ * @brief Implementation of drive logic.
+ * Corrects mirrored motor mounting by inverting the Left motor signal.
  */
 void PorscheGt4::setDrive(int8_t speed) {
-    // We send individual packets to ensure perfect control over sign inversion
     setDrive(speed, speed);
 }
 
 /**
- * @brief Differential Drive Implementation with physical orientation compensation.
+ * @brief Individual motor control. Left motor is inverted to compensate for chassis design.
  */
 void PorscheGt4::setDrive(int8_t leftSpeed, int8_t rightSpeed) {
     auto drive = [&](uint8_t port, int8_t s, bool invert) {
@@ -150,11 +155,14 @@ void PorscheGt4::setDrive(int8_t leftSpeed, int8_t rightSpeed) {
                  static_cast<uint8_t>(PortOutputSubCommand::START_POWER), val, 0x64, 0x03});
     };
 
-    // Rear Left is physically inverted in the GT4 chassis
+    // Left motor (Port 0x32) is physically flipped compared to the Right motor (Port 0x33)
     drive(PORT_DRIVE_L, leftSpeed, true);
     drive(PORT_DRIVE_R, rightSpeed, false);
 }
 
+/**
+ * @brief High-frequency steer command using stack-allocated std::array.
+ */
 void PorscheGt4::setSteerRaw(int32_t absolute_angle, uint8_t speed) {
     std::array<uint8_t, 14> buffer = {static_cast<uint8_t>(MessageLength::GOTO_ABS_POS),
                                       0x00,
@@ -162,14 +170,20 @@ void PorscheGt4::setSteerRaw(int32_t absolute_angle, uint8_t speed) {
                                       PORT_STEER,
                                       0x11,
                                       static_cast<uint8_t>(PortOutputSubCommand::GOTO_ABS_POS)};
+
     std::memcpy(&buffer[6], &absolute_angle, sizeof(int32_t));
+
     buffer[10] = speed;
-    buffer[11] = 0x64;
-    buffer[12] = 0x7E;
-    buffer[13] = 0x03;
+    buffer[11] = 0x64;  // Max Power
+    buffer[12] = 0x7E;  // Braking mode
+    buffer[13] = 0x03;  // Complete feedback
+
     sendRaw(SimpleBLE::ByteArray(reinterpret_cast<const char*>(buffer.data()), buffer.size()));
 }
 
+/**
+ * @brief Mechanical homing. Ensures valid range and maps center to 0.
+ */
 bool PorscheGt4::autoCalibrate() {
     if (!telemetryActive.load()) {
         for (int i = 0; i < 30 && !telemetryActive.load(); i++) std::this_thread::sleep_for(100ms);
@@ -181,9 +195,11 @@ bool PorscheGt4::autoCalibrate() {
 
     const int32_t rawLeft = sweep_to_limit(-30, 40, "LEFT");
     std::this_thread::sleep_for(500ms);
+
     setSteerRaw(initialRawPos, 50);
     waitForMovement(initialRawPos, 3, 4000);
     std::this_thread::sleep_for(500ms);
+
     const int32_t rawRight = sweep_to_limit(30, 40, "RIGHT");
 
     const int32_t totalTravel = std::abs(rawLeft - rawRight);
@@ -198,6 +214,9 @@ bool PorscheGt4::autoCalibrate() {
     return true;
 }
 
+/**
+ * @brief Blocks using Condition Variable until target position is reached.
+ */
 void PorscheGt4::waitForMovement(int32_t target_absolute, int32_t tolerance, int timeout_ms) {
     std::unique_lock<std::mutex> lock(mtx_movement);
     cv_movement.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
@@ -205,14 +224,20 @@ void PorscheGt4::waitForMovement(int32_t target_absolute, int32_t tolerance, int
     });
 }
 
+/**
+ * @brief Low-level power sweep to find mechanical stalls.
+ */
 int32_t PorscheGt4::sweep_to_limit(int8_t speed, uint8_t power, std::string_view label) {
     sendRaw({static_cast<uint8_t>(MessageLength::MOTOR_POWER), 0x00,
              static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND), PORT_STEER, 0x11,
              static_cast<uint8_t>(PortOutputSubCommand::START_POWER), static_cast<uint8_t>(speed),
              power, 0x03});
+
     std::this_thread::sleep_for(600ms);
+
     int32_t last_pos = rawSteerPos.load();
     int stuck_count = 0;
+
     for (int i = 0; i < 80; i++) {
         std::this_thread::sleep_for(100ms);
         int32_t p = rawSteerPos.load();
@@ -220,9 +245,11 @@ int32_t PorscheGt4::sweep_to_limit(int8_t speed, uint8_t power, std::string_view
             stuck_count++;
         else
             stuck_count = 0;
+
         if (stuck_count >= 4) break;
         last_pos = p;
     }
+
     stop();
     return rawSteerPos.load();
 }

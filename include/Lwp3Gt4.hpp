@@ -12,56 +12,76 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
-#include <string>
 #include <string_view>
 
 namespace LWP3 {
 
 /**
  * @class PorscheGt4
- * @brief Advanced controller for the LEGO Technic Porsche GT4 (42176).
- * Now updated to C++20 standards with improved safety and performance.
+ * @brief High-level controller for the LEGO Technic Porsche GT4 (42176).
+ * * Implements thread-safe movement, automatic calibration, and
+ * asynchronous telemetry using C++20 standards.
  */
 class PorscheGt4 {
    public:
-    // --- Callbacks ---
+    // --- Asynchronous Callbacks ---
+
+    /** @brief Triggered on steering change. Returns degrees relative to center. */
     std::function<void(int32_t)> onSteerUpdate;
+
+    /** @brief Triggered on battery level change (0-100%). */
     std::function<void(uint8_t)> onBatteryUpdate;
+
+    /** @brief Triggered when the physical Hub button is toggled. */
     std::function<void(bool)> onButtonUpdate;
+
+    /** @brief Triggered on signal strength updates (dBm). */
     std::function<void(int8_t)> onRssiUpdate;
 
     PorscheGt4();
     ~PorscheGt4();
 
     /**
-     * @brief Connects to the hub using C++20 string_view for zero-allocation literals.
-     * @param address The MAC address of the Hub.
-     * @return True if successful.
+     * @brief Scans and connects to the Porsche Hub.
+     * @param address Bluetooth MAC address (e.g., "28:3C:90:9C:82:14").
+     * @return True if connection succeeds.
      */
     bool connect(std::string_view address);
 
-    /** @brief Safely shuts down motors and disconnects. */
+    /** @brief Gracefully halts motors and closes the Bluetooth link. */
     void disconnect();
 
     /**
-     * @brief Performs mechanical calibration.
-     * @return True if a valid range was discovered.
+     * @brief Performs mechanical steering homing.
+     * Sweeps to physical limits to determine true center and range.
+     * @return True if a valid steering range was found.
      */
     bool autoCalibrate();
 
-    /** @brief Sets steering relative to center. */
+    /**
+     * @brief Commands the steering motor to a specific normalized angle.
+     * @param relative_angle Degrees from 0 (Negative=Left, Positive=Right).
+     */
     void setSteer(int32_t relative_angle);
 
-    /** @brief Sets drive speed for the synchronized Virtual Port. */
+    /**
+     * @brief Sets drive speed for the rear motors (Synchronized).
+     * @note Internally handles motor inversion for symmetrical mounting.
+     * @param speed Target speed from -100 (Reverse) to 100 (Forward).
+     */
     void setDrive(int8_t speed);
 
-    /** @brief Independent rear motor control. */
+    /**
+     * @brief Sets individual speeds for rear motors (Differential Drive).
+     * @param leftSpeed Left rear motor speed (-100 to 100).
+     * @param rightSpeed Right rear motor speed (-100 to 100).
+     */
     void setDrive(int8_t leftSpeed, int8_t rightSpeed);
 
-    /** @brief Immediate halt of all actuators. */
+    /** @brief Stops all motors immediately. */
     void stop();
 
-    // --- Getters ---
+    // --- State Getters ---
     uint8_t getBatteryLevel() const {
         return batteryLevel.load();
     }
@@ -79,15 +99,12 @@ class PorscheGt4 {
    private:
     SimpleBLE::Peripheral porsche;
 
-    // --- Thread-Safe State ---
     std::atomic<int32_t> rawSteerPos{0};
     std::atomic<uint8_t> batteryLevel{0};
     std::atomic<bool> buttonPressed{false};
     std::atomic<int8_t> rssiValue{0};
     std::atomic<bool> telemetryActive{false};
-    std::atomic<uint8_t> virtualDrivePort{0xFF};
 
-    // --- Synchronization (C++20 Design) ---
     std::mutex mtx_movement;
     std::condition_variable cv_movement;
 
@@ -95,18 +112,10 @@ class PorscheGt4 {
     std::atomic<int32_t> minRelative{-60};
     std::atomic<int32_t> maxRelative{60};
 
-    // --- Internal Protocol Logic ---
     void setupNotifications();
-
-    /** @brief Sends raw data using const reference to avoid unnecessary copies. */
     void sendRaw(const SimpleBLE::ByteArray& data);
-
-    /** @brief Move to position using stack-allocated buffers (no heap). */
     void setSteerRaw(int32_t absolute_angle, uint8_t speed = 40);
-
     int32_t sweep_to_limit(int8_t speed, uint8_t power, std::string_view label);
-
-    /** @brief Smart wait using condition variables instead of busy-sleep. */
     void waitForMovement(int32_t target_absolute, int32_t tolerance = 2, int timeout_ms = 3000);
 };
 }  // namespace LWP3
