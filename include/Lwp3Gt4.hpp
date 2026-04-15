@@ -2,11 +2,6 @@
  * @file Lwp3Gt4.hpp
  * @author lsuciu
  * @brief High-performance ADAS SDK for LEGO Porsche GT4.
- * * v2.0 Features:
- * - Asynchronous Control Loop (50Hz)
- * - Mailbox-based TX Pacing (2ms)
- * - Mechanical-aware Calibration
- * - Thread-safe Telemetry Dispatching
  */
 
 #pragma once
@@ -74,7 +69,7 @@ class PorscheGt4 {
 
     // --- Threading Model ---
     std::jthread _controlThread;   ///< Logic loop (50Hz)
-    std::jthread _txThread;        ///< Hardware pipe (2ms)
+    std::jthread _txThread;        ///< Hardware pipe
     std::jthread _dispatchThread;  ///< Telemetry callback isolation
 
     std::atomic<bool> _running{false};

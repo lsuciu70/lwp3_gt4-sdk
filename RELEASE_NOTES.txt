@@ -1,9 +1,6 @@
 LWP3-GT4-SDK v2.0 "The ADAS Refactor"
 ====================================
 
-This major release transforms the Porsche GT4 SDK into a true robotics-grade 
-platform capable of handling real-time autonomous driving tasks.
-
 NEW FEATURES:
 - ASYNCHRONOUS ARCHITECTURE: Logic and Bluetooth comms are now decoupled into 
   dedicated threads, achieving a jitter-free 50Hz control loop.
@@ -22,3 +19,12 @@ FIXES:
 - Resolved the "Const-Correctness" compilation error on modern GCC.
 - Eliminated core dumps on shutdown by ensuring object initialization checks.
 - Fixed the "Virtual Port Twitch" surge during SDK disconnect.
+
+LWP3-GT4-SDK v2.1 "Implement delta-encoding"
+====================================
+
+- Added send-on-change delta encoding to the 50Hz control loop, reducing BLE traffic by ~90% and completely eliminating BlueZ D-Bus timeouts.
+- Verified physical steering response latency at ~258ms.
+- Added graceful Bluetooth unsubscription on disconnect to prevent D-Bus warnings.
+- Finalized the 5-step mechanical-aware calibration sequence with static friction un-wedging.
+

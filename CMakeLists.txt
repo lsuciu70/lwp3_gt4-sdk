@@ -15,3 +15,7 @@ target_link_libraries(lwp3gt4 simpleble::simpleble)
 # Example Application
 add_executable(hello_gt4 examples/hello_gt4.cpp)
 target_link_libraries(hello_gt4 lwp3gt4)
+
+# Minimal BLE test harness (drop-in)
+add_executable(ble_latency_test tests/ble_latency_test.cpp)
+target_link_libraries(ble_latency_test lwp3gt4)
