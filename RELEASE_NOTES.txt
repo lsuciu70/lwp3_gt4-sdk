@@ -59,3 +59,35 @@ REMOVED/DEPRECATED:
 FIXES:
 - Eliminated "Start-Stop" jerky motion by enforcing a steady 50Hz heartbeat.
 - Resolved BlueZ D-Bus timeouts during high-frequency command bursts.
+
+Version: 4.9.0 "The Deterministic HAL"
+====================================
+
+SUMMARY:
+Version 4.9 completes the transition of the SDK into a production-grade 
+Hardware Abstraction Layer (HAL). It removes all "smart" internal control 
+logic (smoothing, PID-like behavior) to provide the raw determinism required 
+for high-speed autonomous state estimation and path tracking.
+
+CORE ARCHITECTURE:
+- Deterministic Timing: Every Telemetry packet and TxEvent now includes 
+  nanosecond-precision CLOCK_MONOTONIC_RAW timestamps.
+- Zero Control Policy: The HAL no longer alters user commands for "feel". 
+  Trajectory smoothing is now the responsibility of the ADAS layer.
+- Thread-Safe Pipeline: Non-blocking command enqueuing and lock-free 
+  telemetry access.
+
+MECHANICAL SAFETY:
+- V3-Robust Calibration: Restored the 5-step gentle calibration sequence 
+  that resets tension between limit tests.
+- Hardware Safety Ramp: An internal protection fuse limits steering deltas 
+  to 15 units per 15ms to protect plastic gears from accidental torque snaps.
+- Soft-Margin Enforcement: Detected limits are padded by 4 units to prevent 
+  physical chassis impacts during autonomous operation.
+
+STABILITY FIXES:
+- BlueZ Hardening: Added GATT service discovery loops to prevent 
+  SimpleBLE "Not Initialized" crashes on Linux.
+- Motor Protocol: Standardized on WriteDirectModeData (0x51) for high-speed 
+  drive and StartSpeed (0x01) for calibration.
+- Persistent Connection: Discovery loop now waits for Hub button press.
