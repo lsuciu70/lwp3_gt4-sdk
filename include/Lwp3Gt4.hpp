@@ -1,7 +1,12 @@
 /**
  * @file Lwp3Gt4.hpp
  * @author lsuciu
- * @brief Public Interface for the PorscheGt4 C++20 SDK.
+ * @brief High-performance ADAS SDK for LEGO Porsche GT4.
+ * * v2.0 Features:
+ * - Asynchronous Control Loop (50Hz)
+ * - Mailbox-based TX Pacing (2ms)
+ * - Mechanical-aware Calibration
+ * - Thread-safe Telemetry Dispatching
  */
 
 #pragma once
@@ -12,110 +17,114 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <queue>
 #include <string_view>
+#include <thread>
 
 namespace LWP3 {
 
-/**
- * @class PorscheGt4
- * @brief High-level controller for the LEGO Technic Porsche GT4 (42176).
- * * Implements thread-safe movement, automatic calibration, and
- * asynchronous telemetry using C++20 standards.
- */
+/** @brief Internal representation of a target control state. */
+struct ControlState {
+    int8_t throttle = 0;  // -100 to 100
+    int32_t steer = 0;    // Relative angle from center
+};
+
+/** @brief Prepared Bluetooth byte packets for the hardware. */
+struct CommandBatch {
+    bool useVirtual = false;
+    SimpleBLE::ByteArray virtualDrive;
+    SimpleBLE::ByteArray leftMotor;
+    SimpleBLE::ByteArray rightMotor;
+    SimpleBLE::ByteArray steering;
+};
+
 class PorscheGt4 {
    public:
-    // --- Asynchronous Callbacks ---
-
-    /** @brief Triggered on steering change. Returns degrees relative to center. */
-    std::function<void(int32_t)> onSteerUpdate;
-
-    /** @brief Triggered on battery level change (0-100%). */
-    std::function<void(uint8_t)> onBatteryUpdate;
-
-    /** @brief Triggered when the physical Hub button is toggled. */
-    std::function<void(bool)> onButtonUpdate;
-
-    /** @brief Triggered on signal strength updates (dBm). */
-    std::function<void(int8_t)> onRssiUpdate;
+    // --- Callbacks (Telemetry) ---
+    std::function<void(int32_t)> onSteerUpdate;            ///< Notifies on steering angle change
+    std::function<void(uint8_t)> onBatteryUpdate;          ///< Notifies on battery % change
+    std::function<void(uint64_t)> onLatencyProfileUpdate;  ///< Notifies on end-to-end loop latency
 
     PorscheGt4();
     ~PorscheGt4();
 
-    /**
-     * @brief Scans and connects to the Porsche Hub.
-     * @param address Bluetooth MAC address (e.g., "28:3C:90:9C:82:14").
-     * @return True if connection succeeds.
-     */
+    /** @brief Continuously scans and connects to a specific MAC address. */
     bool connect(std::string_view address);
 
-    /** @brief Gracefully halts motors and closes the Bluetooth link. */
+    /** @brief Safely shuts down motors and threads before disconnecting. */
     void disconnect();
 
-    /**
-     * @brief Performs mechanical steering homing.
-     * Sweeps to physical limits to determine true center and range.
-     * @return True if a valid steering range was found.
-     */
+    /** @brief Executes a 5-step mechanical calibration to find true steering center. */
     bool autoCalibrate();
 
-    /**
-     * @brief Commands the steering motor to a specific normalized angle.
-     * @param relative_angle Degrees from 0 (Negative=Left, Positive=Right).
-     */
-    void setSteer(int32_t relative_angle);
+    /** @brief Updates the target driving state (Thread-safe). */
+    void updateControl(int8_t throttle, int32_t steer) noexcept;
 
-    /**
-     * @brief Sets drive speed for the rear motors (Synchronized).
-     * @note Internally handles motor inversion for symmetrical mounting.
-     * @param speed Target speed from -100 (Reverse) to 100 (Forward).
-     */
-    void setDrive(int8_t speed);
+    /** @brief Instantly sets throttle and steering targets to zero. */
+    void stop() noexcept;
 
-    /**
-     * @brief Sets individual speeds for rear motors (Differential Drive).
-     * @param leftSpeed Left rear motor speed (-100 to 100).
-     * @param rightSpeed Right rear motor speed (-100 to 100).
-     */
-    void setDrive(int8_t leftSpeed, int8_t rightSpeed);
-
-    /** @brief Stops all motors immediately. */
-    void stop();
-
-    // --- State Getters ---
-    uint8_t getBatteryLevel() const {
-        return batteryLevel.load();
-    }
-    bool isButtonPressed() const {
-        return buttonPressed.load();
-    }
-    int32_t getMinSteer() const {
-        return minRelative.load();
-    }
-    int32_t getMaxSteer() const {
-        return maxRelative.load();
-    }
-    bool isConnected();
+    // --- Status Accessors ---
+    uint8_t getBatteryLevel() const noexcept;
+    bool isConnected() noexcept;
+    bool isLinkHealthy() const noexcept;
 
    private:
     SimpleBLE::Peripheral porsche;
 
+    // --- Threading Model ---
+    std::jthread _controlThread;   ///< Logic loop (50Hz)
+    std::jthread _txThread;        ///< Hardware pipe (2ms)
+    std::jthread _dispatchThread;  ///< Telemetry callback isolation
+
+    std::atomic<bool> _running{false};
+    std::atomic<bool> _linkHealthy{true};
+    std::atomic<bool> _calibrating{false};
+
+    // --- Watchdog & Timestamps ---
+    std::atomic<uint64_t> _lastBrainPulse{0};
+    std::atomic<uint64_t> _lastRxPulse{0};
+    std::atomic<uint64_t> _lastCommandTimestamp{0};
+
+    // --- Thread Safety / Sync ---
+    static constexpr size_t MAX_DISPATCH_QUEUE = 64;
+    std::queue<std::function<void()>> _dispatchQueue;
+    std::mutex _dispatchMtx;
+    std::condition_variable _dispatchCv;
+
+    std::optional<CommandBatch> _latestTxBatch;
+    std::mutex _txMtx;
+    std::condition_variable _txCv;
+    std::atomic<uint64_t> _txSeq{0};
+    int _txErrorCount{0};
+
+    ControlState _targetState;
+    std::mutex _targetMtx;
+
+    // --- Hardware State ---
     std::atomic<int32_t> rawSteerPos{0};
     std::atomic<uint8_t> batteryLevel{0};
-    std::atomic<bool> buttonPressed{false};
-    std::atomic<int8_t> rssiValue{0};
     std::atomic<bool> telemetryActive{false};
-
-    std::mutex mtx_movement;
-    std::condition_variable cv_movement;
+    std::atomic<uint8_t> virtualDrivePort{0xFF};
 
     int32_t hardwareCenter = 0;
-    std::atomic<int32_t> minRelative{-60};
-    std::atomic<int32_t> maxRelative{60};
+    int32_t minRelative = -65;
+    int32_t maxRelative = 65;
 
-    void setupNotifications();
-    void sendRaw(const SimpleBLE::ByteArray& data);
-    void setSteerRaw(int32_t absolute_angle, uint8_t speed = 40);
-    int32_t sweep_to_limit(int8_t speed, uint8_t power, std::string_view label);
-    void waitForMovement(int32_t target_absolute, int32_t tolerance = 2, int timeout_ms = 3000);
+    // --- Internal Loops ---
+    void controlLoop(std::stop_token st);
+    void txLoop(std::stop_token st);
+    void dispatchLoop(std::stop_token st);
+
+    void queueTelemetry(std::function<void()> cb);
+    void sendImmediate(const SimpleBLE::ByteArray& data);
+    void sendReliable(const SimpleBLE::ByteArray& data);
+
+    void setupHandshake();
+    int32_t sweep_to_limit(int8_t speed, uint8_t power);
+    void waitForMovement(int32_t target_absolute, int32_t tolerance = 4, int timeout_ms = 3000);
+
+    SimpleBLE::ByteArray buildSteerCmd(int32_t absolute_angle, uint8_t speed = 50);
+    SimpleBLE::ByteArray buildDriveCmd(uint8_t port, int8_t speed, uint8_t power = 100);
 };
 }  // namespace LWP3

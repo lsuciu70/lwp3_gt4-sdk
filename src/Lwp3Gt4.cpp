@@ -1,16 +1,16 @@
 /**
  * @file Lwp3Gt4.cpp
- * @brief Implementation of the PorscheGt4 C++20 SDK.
+ * @brief Logic implementation for the Porsche GT4 v2.0 SDK.
  */
 
 #include "Lwp3Gt4.hpp"
 
 #include <algorithm>
 #include <array>
-#include <cmath>
+#include <chrono>
 #include <cstring>
 #include <iostream>
-#include <thread>
+#include <ranges>
 
 #include "Lwp3Constants.hpp"
 
@@ -23,9 +23,13 @@ PorscheGt4::~PorscheGt4() {
     disconnect();
 }
 
-/**
- * @brief Scans for the specific peripheral using C++20 ranges.
- */
+/** @brief Returns current monotonic time in milliseconds. */
+inline uint64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 bool PorscheGt4::connect(std::string_view address) {
     while (true) {
         auto adapters = SimpleBLE::Adapter::get_adapters();
@@ -39,33 +43,41 @@ bool PorscheGt4::connect(std::string_view address) {
 
         adapter.scan_for(1000);
         auto results = adapter.scan_get_results();
-
-        // Range-based search with non-const lambda to satisfy SimpleBLE's API
         auto it = std::ranges::find_if(results, [&](auto& p) { return p.address() == address; });
 
         if (it != results.end()) {
             porsche = *it;
             std::cout << "\n[SDK] Hub detected! Connecting..." << std::endl;
+
             try {
                 porsche.connect();
-                std::this_thread::sleep_for(1500ms);
-                setupNotifications();
+                _running = true;
+                _linkHealthy = true;
+                _txErrorCount = 0;
+                _calibrating = false;
 
-                // Enable Telemetry updates
-                auto enable_prop = [&](HubProperty prop) {
-                    sendRaw({static_cast<uint8_t>(MessageLength::HUB_PROP_SETUP), 0x00,
-                             static_cast<uint8_t>(MessageType::HUB_PROPERTIES),
-                             static_cast<uint8_t>(prop),
-                             static_cast<uint8_t>(HubPropertyOperation::ENABLE_UPDATES)});
-                };
+                // Start asynchronous architecture
+                _dispatchThread = std::jthread([this](std::stop_token st) { dispatchLoop(st); });
+                _txThread = std::jthread([this](std::stop_token st) { txLoop(st); });
 
-                enable_prop(HubProperty::BATTERY_VOLTAGE);
-                enable_prop(HubProperty::BUTTON_STATE);
-                enable_prop(HubProperty::RSSI);
+                setupHandshake();
 
+                // Wait for sensors to come alive
+                int retries = 0;
+                while (!telemetryActive.load() && retries++ < 20) {
+                    std::this_thread::sleep_for(50ms);
+                }
+
+                if (!telemetryActive.load()) {
+                    std::cerr << "\n[SDK] Handshake timeout. Telemetry not active." << std::endl;
+                    disconnect();
+                    return false;
+                }
+
+                _controlThread = std::jthread([this](std::stop_token st) { controlLoop(st); });
                 return true;
             } catch (const std::exception& e) {
-                std::cerr << "\n[SDK] Handshake error: " << e.what() << ". Retrying..."
+                std::cerr << "\n[SDK] Connection failed: " << e.what() << ". Retrying..."
                           << std::endl;
             }
         }
@@ -73,217 +85,338 @@ bool PorscheGt4::connect(std::string_view address) {
     }
 }
 
-/**
- * @brief Processes incoming LWP3 notifications. Uses std::memcpy for aliasing safety.
+/** * @brief Logic thread.
+ * Converts high-level targets into motor commands at 50Hz.
  */
-void PorscheGt4::setupNotifications() {
-    try {
-        porsche.notify(SERVICE_UUID.data(), CHAR_UUID.data(), [this](SimpleBLE::ByteArray data) {
-            const auto* raw = reinterpret_cast<const uint8_t*>(data.data());
-            if (data.size() < 3) return;
+void PorscheGt4::controlLoop(std::stop_token st) {
+    auto nextTick = std::chrono::steady_clock::now();
 
-            const auto msgType = static_cast<MessageType>(raw[2]);
+    while (!st.stop_requested()) {
+        nextTick += 20ms;
+        auto now = std::chrono::steady_clock::now();
+        if (now > nextTick + 5ms) nextTick = now;
 
-            switch (msgType) {
-                case MessageType::PORT_VALUE_SINGLE:
-                    if (raw[3] == PORT_STEER) {
-                        int32_t pos = 0;
-                        // Use std::memcpy to avoid Strict Aliasing UB and Alignment issues
-                        std::memcpy(&pos, &raw[4], sizeof(int32_t));
-                        rawSteerPos.store(pos);
-                        telemetryActive.store(true);
+        if (_calibrating.load()) {
+            std::this_thread::sleep_until(nextTick);
+            continue;
+        }
 
-                        // Wake up blocking threads (calibration/homing)
-                        cv_movement.notify_all();
+        uint64_t current_time = now_ms();
+        _linkHealthy = (_txErrorCount < 10);
 
-                        if (onSteerUpdate) onSteerUpdate(pos - hardwareCenter);
-                    }
-                    break;
+        ControlState current;
+        {
+            std::lock_guard lock(_targetMtx);
+            current = _targetState;
+        }
 
-                case MessageType::HUB_PROPERTIES: {
-                    const auto prop = static_cast<HubProperty>(raw[3]);
-                    if (static_cast<HubPropertyOperation>(raw[4]) != HubPropertyOperation::UPDATE)
-                        break;
+        // Failsafe: Stop if brain stops sending pulses
+        if (!_linkHealthy.load() || current_time - _lastBrainPulse.load() > 200) {
+            current.throttle = 0;
+            current.steer = 0;
+        }
 
-                    if (prop == HubProperty::BATTERY_VOLTAGE) {
-                        batteryLevel.store(raw[5]);
-                        if (onBatteryUpdate) onBatteryUpdate(raw[5]);
-                    } else if (prop == HubProperty::BUTTON_STATE) {
-                        bool pressed = (raw[5] == 0x01);
-                        buttonPressed.store(pressed);
-                        if (onButtonUpdate) onButtonUpdate(pressed);
-                    } else if (prop == HubProperty::RSSI) {
-                        int8_t rssi = static_cast<int8_t>(raw[5]);
-                        rssiValue.store(rssi);
-                        if (onRssiUpdate) onRssiUpdate(rssi);
-                    }
-                    break;
-                }
-                default:
-                    break;
+        int8_t speedL = std::clamp((int)-current.throttle, -100, 100);
+        int8_t speedR = std::clamp((int)current.throttle, -100, 100);
+        int32_t targetAbs = hardwareCenter + current.steer;
+
+        CommandBatch batch;
+        uint8_t vPort = virtualDrivePort.load();
+
+        // Virtual Port Optimization (reduces BLE traffic)
+        if (std::abs(speedL + speedR) <= 5 && vPort != 0xFF) {
+            batch.useVirtual = true;
+            batch.virtualDrive = buildDriveCmd(vPort, speedR);
+        } else {
+            batch.useVirtual = false;
+            batch.leftMotor = buildDriveCmd(PORT_DRIVE_L, speedL);
+            batch.rightMotor = buildDriveCmd(PORT_DRIVE_R, speedR);
+        }
+        batch.steering = buildSteerCmd(targetAbs);
+
+        {
+            std::lock_guard lock(_txMtx);
+            _latestTxBatch = std::move(batch);
+            _txSeq++;
+        }
+        _txCv.notify_one();
+
+        std::this_thread::sleep_until(nextTick);
+    }
+}
+
+/**
+ * @brief Hardware pipe thread.
+ * Consumes the latest available batch from the mailbox and pushes to Bluetooth.
+ */
+void PorscheGt4::txLoop(std::stop_token st) {
+    uint64_t lastConsumedSeq = 0;
+
+    while (!st.stop_requested()) {
+        CommandBatch batch;
+        {
+            std::unique_lock lock(_txMtx);
+            _txCv.wait(lock,
+                       [&] { return _txSeq.load() != lastConsumedSeq || st.stop_requested(); });
+            if (st.stop_requested()) return;
+
+            lastConsumedSeq = _txSeq.load();
+            batch = std::move(*_latestTxBatch);
+        }
+
+        try {
+            if (batch.useVirtual) {
+                porsche.write_command(SERVICE_UUID, CHAR_UUID, batch.virtualDrive);
+            } else {
+                porsche.write_command(SERVICE_UUID, CHAR_UUID, batch.leftMotor);
+                porsche.write_command(SERVICE_UUID, CHAR_UUID, batch.rightMotor);
             }
-        });
-
-        // Subscription for steering motor telemetry
-        sendRaw({static_cast<uint8_t>(MessageLength::PORT_INPUT_FORMAT), 0x00,
-                 static_cast<uint8_t>(MessageType::PORT_INPUT_FORMAT_SETUP), PORT_STEER, 0x02, 0x01,
-                 0x00, 0x00, 0x00, 0x01});
-    } catch (const std::exception& e) {
-        std::cerr << "[SDK] Notification link error: " << e.what() << std::endl;
+            porsche.write_command(SERVICE_UUID, CHAR_UUID, batch.steering);
+            _txErrorCount = 0;
+        } catch (...) {
+            _txErrorCount++;
+        }
+        std::this_thread::sleep_for(2ms);
     }
 }
 
-/**
- * @brief Implementation of drive logic.
- * Corrects mirrored motor mounting by inverting the Left motor signal.
- */
-void PorscheGt4::setDrive(int8_t speed) {
-    setDrive(speed, speed);
+void PorscheGt4::dispatchLoop(std::stop_token st) {
+    while (!st.stop_requested()) {
+        std::function<void()> task;
+        {
+            std::unique_lock lock(_dispatchMtx);
+            _dispatchCv.wait(lock, [&] { return !_dispatchQueue.empty() || st.stop_requested(); });
+            if (st.stop_requested()) return;
+            task = std::move(_dispatchQueue.front());
+            _dispatchQueue.pop();
+        }
+        if (task) task();
+    }
 }
 
-/**
- * @brief Individual motor control. Left motor is inverted to compensate for chassis design.
- */
-void PorscheGt4::setDrive(int8_t leftSpeed, int8_t rightSpeed) {
-    auto drive = [&](uint8_t port, int8_t s, bool invert) {
-        int final_speed = std::clamp(static_cast<int>(s), -100, 100);
-        if (invert) final_speed *= -1;  // Compensate for physical orientation
-
-        uint8_t val = static_cast<uint8_t>(final_speed);
-        sendRaw({static_cast<uint8_t>(MessageLength::MOTOR_POWER), 0x00,
-                 static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND), port, 0x11,
-                 static_cast<uint8_t>(PortOutputSubCommand::START_POWER), val, 0x64, 0x03});
-    };
-
-    // Left motor (Port 0x32) is physically flipped compared to the Right motor (Port 0x33)
-    drive(PORT_DRIVE_L, leftSpeed, true);
-    drive(PORT_DRIVE_R, rightSpeed, false);
+void PorscheGt4::updateControl(int8_t throttle, int32_t steer) noexcept {
+    {
+        std::lock_guard lock(_targetMtx);
+        _targetState.throttle = throttle;
+        _targetState.steer = std::clamp(steer, minRelative, maxRelative);
+    }
+    _lastCommandTimestamp = now_ms();
+    _lastBrainPulse = _lastCommandTimestamp.load();
 }
 
-/**
- * @brief High-frequency steer command using stack-allocated std::array.
- */
-void PorscheGt4::setSteerRaw(int32_t absolute_angle, uint8_t speed) {
-    std::array<uint8_t, 14> buffer = {static_cast<uint8_t>(MessageLength::GOTO_ABS_POS),
-                                      0x00,
-                                      static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND),
-                                      PORT_STEER,
-                                      0x11,
-                                      static_cast<uint8_t>(PortOutputSubCommand::GOTO_ABS_POS)};
-
-    std::memcpy(&buffer[6], &absolute_angle, sizeof(int32_t));
-
-    buffer[10] = speed;
-    buffer[11] = 0x64;  // Max Power
-    buffer[12] = 0x7E;  // Braking mode
-    buffer[13] = 0x03;  // Complete feedback
-
-    sendRaw(SimpleBLE::ByteArray(reinterpret_cast<const char*>(buffer.data()), buffer.size()));
+void PorscheGt4::queueTelemetry(std::function<void()> cb) {
+    std::lock_guard lock(_dispatchMtx);
+    if (_dispatchQueue.size() >= MAX_DISPATCH_QUEUE) _dispatchQueue.pop();
+    _dispatchQueue.push(std::move(cb));
+    _dispatchCv.notify_one();
 }
 
-/**
- * @brief Mechanical homing. Ensures valid range and maps center to 0.
- */
+void PorscheGt4::setupHandshake() {
+    porsche.notify(SERVICE_UUID, CHAR_UUID, [this](SimpleBLE::ByteArray data) {
+        if (!_running.load()) return;
+
+        uint64_t current_ms = now_ms();
+        _lastRxPulse = current_ms;
+
+        auto* raw = reinterpret_cast<const uint8_t*>(data.data());
+        if (data.size() < 3) return;
+
+        // Steering Telemetry
+        if (raw[2] == (uint8_t)MessageType::PORT_VALUE_SINGLE && raw[3] == PORT_STEER) {
+            if (data.size() < 8) return;
+            int32_t val;
+            std::memcpy(&val, &raw[4], sizeof(int32_t));
+            rawSteerPos.store(val);
+            telemetryActive.store(true);
+
+            if (onSteerUpdate) queueTelemetry([this, val] { onSteerUpdate(val - hardwareCenter); });
+
+            uint64_t lastCmd = _lastCommandTimestamp.load();
+            if (lastCmd > 0 && onLatencyProfileUpdate) {
+                uint64_t latency = current_ms - lastCmd;
+                queueTelemetry([this, latency] { onLatencyProfileUpdate(latency); });
+            }
+        }
+        // Battery Telemetry
+        else if (raw[2] == (uint8_t)MessageType::HUB_PROPERTIES &&
+                 raw[4] == (uint8_t)HubPropertyOperation::UPDATE) {
+            if (raw[3] == (uint8_t)HubProperty::BATTERY_VOLTAGE) {
+                batteryLevel.store(raw[5]);
+                if (onBatteryUpdate) queueTelemetry([this, b = raw[5]] { onBatteryUpdate(b); });
+            }
+        }
+        // Virtual Port Mapping
+        else if (raw[2] == (uint8_t)MessageType::HUB_ATTACHED_IO && raw[4] == 0x02) {
+            if (raw[7] == PORT_DRIVE_L && raw[8] == PORT_DRIVE_R) virtualDrivePort.store(raw[3]);
+        }
+    });
+
+    sendReliable({(uint8_t)MessageLength::PORT_INPUT_FORMAT, 0x00,
+                  (uint8_t)MessageType::PORT_INPUT_FORMAT_SETUP, PORT_STEER, 0x02, 0x01, 0x00, 0x00,
+                  0x00, 0x01});
+    sendReliable({(uint8_t)MessageLength::HUB_PROP_SETUP, 0x00,
+                  (uint8_t)MessageType::HUB_PROPERTIES, (uint8_t)HubProperty::BATTERY_VOLTAGE,
+                  (uint8_t)HubPropertyOperation::ENABLE_UPDATES});
+}
+
+SimpleBLE::ByteArray PorscheGt4::buildDriveCmd(uint8_t port, int8_t speed, uint8_t power) {
+    std::array<uint8_t, (uint8_t)MessageLength::MOTOR_POWER> buf = {
+        (uint8_t)MessageLength::MOTOR_POWER,
+        0x00,
+        (uint8_t)MessageType::PORT_OUTPUT_COMMAND,
+        port,
+        0x11,
+        (uint8_t)PortOutputSubCommand::START_POWER,
+        (uint8_t)speed,
+        power,
+        0x03};
+    return SimpleBLE::ByteArray(reinterpret_cast<const char*>(buf.data()), buf.size());
+}
+
+SimpleBLE::ByteArray PorscheGt4::buildSteerCmd(int32_t absolute_angle, uint8_t speed) {
+    std::array<uint8_t, (uint8_t)MessageLength::GOTO_ABS_POS> buf = {
+        (uint8_t)MessageLength::GOTO_ABS_POS,
+        0x00,
+        (uint8_t)MessageType::PORT_OUTPUT_COMMAND,
+        PORT_STEER,
+        0x11,
+        (uint8_t)PortOutputSubCommand::GOTO_ABS_POS};
+    std::memcpy(&buf[6], &absolute_angle, sizeof(int32_t));
+    buf[10] = speed;
+    buf[11] = 0x64;
+    buf[12] = 0x7E;
+    buf[13] = 0x03;
+    return SimpleBLE::ByteArray(reinterpret_cast<const char*>(buf.data()), buf.size());
+}
+
+void PorscheGt4::sendImmediate(const SimpleBLE::ByteArray& data) {
+    if (porsche.initialized() && porsche.is_connected()) {
+        porsche.write_command(SERVICE_UUID, CHAR_UUID, data);
+    }
+}
+
+void PorscheGt4::sendReliable(const SimpleBLE::ByteArray& data) {
+    if (porsche.initialized() && porsche.is_connected()) {
+        try {
+            porsche.write_command(SERVICE_UUID, CHAR_UUID, data);
+        } catch (...) {
+        }
+        std::this_thread::sleep_for(40ms);
+    }
+}
+
 bool PorscheGt4::autoCalibrate() {
-    if (!telemetryActive.load()) {
-        for (int i = 0; i < 30 && !telemetryActive.load(); i++) std::this_thread::sleep_for(100ms);
-    }
+    for (int i = 0; i < 30 && !telemetryActive.load(); i++) std::this_thread::sleep_for(100ms);
     if (!telemetryActive.load()) return false;
 
-    const int32_t initialRawPos = rawSteerPos.load();
+    _calibrating.store(true);
+
+    int32_t initialRawPos = rawSteerPos.load();
     hardwareCenter = initialRawPos;
+    std::cout << "[SDK] Initial sensor position: " << hardwareCenter << std::endl;
 
-    const int32_t rawLeft = sweep_to_limit(-30, 40, "LEFT");
+    // 1. Go Left
+    int32_t rawL = sweep_to_limit(-40, 60);
+    std::cout << "[SDK] Left physical limit: " << rawL << std::endl;
+
+    // 2. Return to Initial (un-wedge)
+    sendReliable(buildSteerCmd(initialRawPos, 50));
+    waitForMovement(initialRawPos, 4, 3000);
+    std::this_thread::sleep_for(200ms);
+
+    // 3. Go Right
+    int32_t rawR = sweep_to_limit(40, 60);
+    std::cout << "[SDK] Right physical limit: " << rawR << std::endl;
+
+    _calibrating.store(false);
+
+    if (std::abs(rawL - rawR) < 70) {
+        std::cout << "[SDK] Range too small: " << std::abs(rawL - rawR) << " (Expected > 70)"
+                  << std::endl;
+        return false;
+    }
+
+    // Calculate True Center
+    hardwareCenter = (rawL + rawR) / 2;
+    minRelative = std::min(rawL, rawR) - hardwareCenter;
+    maxRelative = std::max(rawL, rawR) - hardwareCenter;
+
+    std::cout << "[SDK] True center calculated: " << hardwareCenter << std::endl;
+
+    updateControl(0, 0);
     std::this_thread::sleep_for(500ms);
 
-    setSteerRaw(initialRawPos, 50);
-    waitForMovement(initialRawPos, 3, 4000);
-    std::this_thread::sleep_for(500ms);
-
-    const int32_t rawRight = sweep_to_limit(30, 40, "RIGHT");
-
-    const int32_t totalTravel = std::abs(rawLeft - rawRight);
-    if (totalTravel < 80) return false;
-
-    hardwareCenter = (rawLeft + rawRight) / 2;
-    minRelative.store(std::min(rawLeft, rawRight) - hardwareCenter);
-    maxRelative.store(std::max(rawLeft, rawRight) - hardwareCenter);
-
-    setSteer(0);
-    waitForMovement(hardwareCenter, 1, 3000);
+    _lastCommandTimestamp.store(0);
     return true;
 }
 
-/**
- * @brief Blocks using Condition Variable until target position is reached.
- */
-void PorscheGt4::waitForMovement(int32_t target_absolute, int32_t tolerance, int timeout_ms) {
-    std::unique_lock<std::mutex> lock(mtx_movement);
-    cv_movement.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-        return std::abs(rawSteerPos.load() - target_absolute) <= tolerance;
-    });
-}
-
-/**
- * @brief Low-level power sweep to find mechanical stalls.
- */
-int32_t PorscheGt4::sweep_to_limit(int8_t speed, uint8_t power, std::string_view label) {
-    sendRaw({static_cast<uint8_t>(MessageLength::MOTOR_POWER), 0x00,
-             static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND), PORT_STEER, 0x11,
-             static_cast<uint8_t>(PortOutputSubCommand::START_POWER), static_cast<uint8_t>(speed),
-             power, 0x03});
-
-    std::this_thread::sleep_for(600ms);
+int32_t PorscheGt4::sweep_to_limit(int8_t speed, uint8_t power) {
+    sendReliable(buildDriveCmd(PORT_STEER, speed, power));
+    std::this_thread::sleep_for(700ms);
 
     int32_t last_pos = rawSteerPos.load();
     int stuck_count = 0;
 
     for (int i = 0; i < 80; i++) {
-        std::this_thread::sleep_for(100ms);
+        std::this_thread::sleep_for(80ms);
         int32_t p = rawSteerPos.load();
-        if (std::abs(p - last_pos) < 1)
+        if (std::abs(p - last_pos) <= 2)
             stuck_count++;
         else
             stuck_count = 0;
-
         if (stuck_count >= 4) break;
         last_pos = p;
     }
 
-    stop();
+    sendReliable(buildDriveCmd(PORT_STEER, 0, 100));
+    std::this_thread::sleep_for(300ms);
     return rawSteerPos.load();
 }
 
-void PorscheGt4::setSteer(int32_t relative_angle) {
-    int32_t clamped = std::clamp(relative_angle, minRelative.load(), maxRelative.load());
-    setSteerRaw(hardwareCenter + clamped, 50);
-}
-
-void PorscheGt4::stop() {
-    setDrive(0, 0);
-    sendRaw({static_cast<uint8_t>(MessageLength::MOTOR_POWER), 0x00,
-             static_cast<uint8_t>(MessageType::PORT_OUTPUT_COMMAND), PORT_STEER, 0x11,
-             static_cast<uint8_t>(PortOutputSubCommand::START_POWER), 0x00, 0x64, 0x03});
-}
-
-void PorscheGt4::sendRaw(const SimpleBLE::ByteArray& data) {
-    if (!porsche.is_connected()) return;
-    try {
-        porsche.write_request(SERVICE_UUID.data(), CHAR_UUID.data(), data);
-    } catch (...) {
+void PorscheGt4::waitForMovement(int32_t target_absolute, int32_t tolerance, int timeout_ms) {
+    int elapsed = 0;
+    while (elapsed < timeout_ms) {
+        if (std::abs(rawSteerPos.load() - target_absolute) <= tolerance) return;
+        std::this_thread::sleep_for(50ms);
+        elapsed += 50;
     }
 }
 
 void PorscheGt4::disconnect() {
-    if (porsche.is_connected()) {
-        stop();
-        std::this_thread::sleep_for(500ms);
+    _running = false;
+    _controlThread.request_stop();
+    _txThread.request_stop();
+    _dispatchThread.request_stop();
+
+    _dispatchCv.notify_all();
+    _txCv.notify_all();
+
+    if (porsche.initialized() && porsche.is_connected()) {
+        uint8_t vPort = virtualDrivePort.load();
+        if (vPort != 0xFF)
+            sendReliable(buildDriveCmd(vPort, 0));
+        else {
+            sendReliable(buildDriveCmd(PORT_DRIVE_L, 0));
+            sendReliable(buildDriveCmd(PORT_DRIVE_R, 0));
+        }
+        std::this_thread::sleep_for(200ms);
         porsche.disconnect();
     }
 }
 
-bool PorscheGt4::isConnected() {
-    return porsche.is_connected();
+void PorscheGt4::stop() noexcept {
+    updateControl(0, 0);
+    _lastCommandTimestamp.store(0);
+}
+
+bool PorscheGt4::isConnected() noexcept {
+    return porsche.initialized() && porsche.is_connected();
+}
+bool PorscheGt4::isLinkHealthy() const noexcept {
+    return _linkHealthy.load();
+}
+uint8_t PorscheGt4::getBatteryLevel() const noexcept {
+    return batteryLevel.load();
 }
 
 }  // namespace LWP3

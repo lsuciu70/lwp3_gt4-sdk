@@ -1,0 +1,24 @@
+LWP3-GT4-SDK v2.0 "The ADAS Refactor"
+====================================
+
+This major release transforms the Porsche GT4 SDK into a true robotics-grade 
+platform capable of handling real-time autonomous driving tasks.
+
+NEW FEATURES:
+- ASYNCHRONOUS ARCHITECTURE: Logic and Bluetooth comms are now decoupled into 
+  dedicated threads, achieving a jitter-free 50Hz control loop.
+- MAILBOX PATTERN: Implemented a sequence-based TX mailbox. The hardware 
+  thread consumes the newest control batch every 2ms, preventing packet 
+  congestion while ensuring the lowest possible command latency.
+- MECHANICAL-AWARE CALIBRATION: Uses a 5-step sliding window algorithm to find 
+  physical chassis limits, intelligently handling gear-clutch slippage and 
+  static-friction wedging.
+- ADAS WATCHDOG: Monitors TX success rates to detect link degradation. If 
+  communication is lost, the car executes an emergency stop within 200ms.
+- VIRTUAL PORT OPTIMIZATION: Automatically combines Left and Right motor 
+  channels when driving straight, halving the Bluetooth traffic load.
+
+FIXES:
+- Resolved the "Const-Correctness" compilation error on modern GCC.
+- Eliminated core dumps on shutdown by ensuring object initialization checks.
+- Fixed the "Virtual Port Twitch" surge during SDK disconnect.
