@@ -28,3 +28,34 @@ LWP3-GT4-SDK v2.1 "Implement delta-encoding"
 - Added graceful Bluetooth unsubscription on disconnect to prevent D-Bus warnings.
 - Finalized the 5-step mechanical-aware calibration sequence with static friction un-wedging.
 
+Version: 3.0.0 "Async Pipeline"
+====================================
+
+SUMMARY:
+Version 3.0.0 represents a complete architectural overhaul, transitioning the 
+SDK from a synchronous callback-driven library to a high-performance, 
+asynchronous Real-Time Hardware Abstraction Layer (HAL).
+
+NEW FEATURES:
+- Asynchronous API: Commands and Telemetry are now decoupled via thread-safe 
+  queues (TSQueue). Application logic can now run at deterministic frequencies 
+  (e.g., 50Hz) regardless of BLE jitter.
+- Triple-Threaded Architecture:
+    1. BLE RX Thread (SimpleBLE): Ingests raw hardware packets.
+    2. Logic/Damping Thread (50Hz): Handles rate-limiting and gear protection.
+    3. BLE TX Thread (66Hz): Manages high-speed D-Bus command dispatch.
+- Soft-Margin Protection: Calibration now implements a 'SOFT_MARGIN' that 
+  prevents the steering servo from physically impacting plastic end-stops.
+- Safety Watchdog: Automatic throttle cut-off if the 'Brain Pulse' (Autonomy 
+  command) is not received within 200ms.
+- Enhanced Telemetry: Telemetry packets now include Battery Level, Link Health 
+  status, and high-resolution Monotonic Timestamps for Kalman Filter integration.
+
+REMOVED/DEPRECATED:
+- Deprecated 'onSteerUpdate' and 'onBatteryUpdate' callbacks.
+- Removed 'updateControl' in favor of 'setCommand'.
+- Removed blocking 'isLinkHealthy' calls in favor of Telemetry packet polling.
+
+FIXES:
+- Eliminated "Start-Stop" jerky motion by enforcing a steady 50Hz heartbeat.
+- Resolved BlueZ D-Bus timeouts during high-frequency command bursts.

@@ -1,7 +1,10 @@
 /**
  * @file Lwp3Gt4.hpp
  * @author lsuciu
- * @brief High-performance ADAS SDK for LEGO Porsche GT4.
+ * @brief High-performance C++20 HAL for LEGO Technic Porsche GT4 (LWP3 Protocol).
+ * @version 3.0.0
+ * * This version introduces a fully asynchronous, triple-threaded architecture
+ * designed for real-time ADAS and autonomous racing applications.
  */
 
 #pragma once
@@ -10,6 +13,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -19,13 +23,53 @@
 
 namespace LWP3 {
 
-/** @brief Internal representation of a target control state. */
-struct ControlState {
-    int8_t throttle = 0;  // -100 to 100
-    int32_t steer = 0;    // Relative angle from center
+/**
+ * @brief Thread-safe telemetry snapshot.
+ * Bundles all physical hardware states into a single atomic push.
+ */
+struct Telemetry {
+    int32_t steer_pos;      ///< Current relative steering angle (center = 0)
+    uint8_t battery_level;  ///< Hub battery percentage (0-100)
+    bool link_healthy;      ///< False if BLE watchdog or TX errors detected
+    uint64_t timestamp_ns;  ///< Monotonic raw nanoseconds for state estimation
 };
 
-/** @brief Prepared Bluetooth byte packets for the hardware. */
+/**
+ * @brief Internal Thread-Safe SPSC (Single-Producer Single-Consumer) Queue.
+ * Bridges the high-speed BLE RX/TX threads with the Autonomy application loop.
+ */
+template <typename T>
+class TSQueue {
+   public:
+    void push(const T& v) {
+        std::lock_guard<std::mutex> lock(m_);
+        q_.push_back(v);
+    }
+
+    bool try_pop(T& out) {
+        std::lock_guard<std::mutex> lock(m_);
+        if (q_.empty()) return false;
+        out = q_.front();
+        q_.pop_front();
+        return true;
+    }
+
+   private:
+    std::mutex m_;
+    std::deque<T> q_;
+};
+
+/**
+ * @brief Internal representation of a target control state.
+ */
+struct ControlState {
+    int8_t throttle = 0;
+    int32_t steer = 0;
+};
+
+/**
+ * @brief Prepared Bluetooth byte packets for the hardware layer.
+ */
 struct CommandBatch {
     bool useVirtual = false;
     SimpleBLE::ByteArray virtualDrive;
@@ -34,32 +78,55 @@ struct CommandBatch {
     SimpleBLE::ByteArray steering;
 };
 
+/**
+ * @class PorscheGt4
+ * @brief The primary Hardware Abstraction Layer (HAL) for the vehicle.
+ */
 class PorscheGt4 {
    public:
-    // --- Callbacks (Telemetry) ---
-    std::function<void(int32_t)> onSteerUpdate;            ///< Notifies on steering angle change
-    std::function<void(uint8_t)> onBatteryUpdate;          ///< Notifies on battery % change
-    std::function<void(uint64_t)> onLatencyProfileUpdate;  ///< Notifies on end-to-end loop latency
-
     PorscheGt4();
     ~PorscheGt4();
 
-    /** @brief Continuously scans and connects to a specific MAC address. */
+    /**
+     * @brief Connects to the vehicle via MAC address.
+     * Spawns the internal TX and Control threads upon success.
+     */
     bool connect(std::string_view address);
 
-    /** @brief Safely shuts down motors and threads before disconnecting. */
+    /**
+     * @brief Cleanly shuts down motors and joins threads.
+     */
     void disconnect();
 
-    /** @brief Executes a 5-step mechanical calibration to find true steering center. */
+    /**
+     * @brief Performs a physical calibration sweep.
+     * Detects mechanical end-stops and calculates soft-margin limits.
+     */
     bool autoCalibrate();
 
-    /** @brief Updates the target driving state (Thread-safe). */
-    void updateControl(int8_t throttle, int32_t steer) noexcept;
+    /**
+     * @brief Updates the vehicle targets (Non-blocking).
+     * Commands are rate-limited and damped internally to protect gears.
+     * @param throttle Speed -100 to 100.
+     * @param steer Relative angle from center.
+     */
+    void setCommand(int8_t throttle, int32_t steer) noexcept;
 
-    /** @brief Instantly sets throttle and steering targets to zero. */
+    /**
+     * @brief Retrieves the next telemetry packet from the queue.
+     * @return true if data was available.
+     */
+    bool pollTelemetry(Telemetry& out_telemetry);
+
+    /**
+     * @brief Emergengy stop. Kills throttle but maintains current steering.
+     */
     void stop() noexcept;
 
-    // --- Status Accessors ---
+    /** @brief Simulation hook for software-in-the-loop testing. */
+    void mockBleNotification(int32_t simulated_steer);
+
+    // Status Accessors
     uint8_t getBatteryLevel() const noexcept;
     bool isConnected() noexcept;
     bool isLinkHealthy() const noexcept;
@@ -67,25 +134,18 @@ class PorscheGt4 {
    private:
     SimpleBLE::Peripheral porsche;
 
-    // --- Threading Model ---
-    std::jthread _controlThread;   ///< Logic loop (50Hz)
-    std::jthread _txThread;        ///< Hardware pipe
-    std::jthread _dispatchThread;  ///< Telemetry callback isolation
+    std::jthread _controlThread;
+    std::jthread _txThread;
 
     std::atomic<bool> _running{false};
     std::atomic<bool> _linkHealthy{true};
     std::atomic<bool> _calibrating{false};
 
-    // --- Watchdog & Timestamps ---
     std::atomic<uint64_t> _lastBrainPulse{0};
     std::atomic<uint64_t> _lastRxPulse{0};
     std::atomic<uint64_t> _lastCommandTimestamp{0};
 
-    // --- Thread Safety / Sync ---
-    static constexpr size_t MAX_DISPATCH_QUEUE = 64;
-    std::queue<std::function<void()>> _dispatchQueue;
-    std::mutex _dispatchMtx;
-    std::condition_variable _dispatchCv;
+    TSQueue<Telemetry> _telemetryQueue;
 
     std::optional<CommandBatch> _latestTxBatch;
     std::mutex _txMtx;
@@ -96,9 +156,8 @@ class PorscheGt4 {
     ControlState _targetState;
     std::mutex _targetMtx;
 
-    // --- Hardware State ---
     std::atomic<int32_t> rawSteerPos{0};
-    std::atomic<uint8_t> batteryLevel{0};
+    std::atomic<uint8_t> batteryLevel{100};
     std::atomic<bool> telemetryActive{false};
     std::atomic<uint8_t> virtualDrivePort{0xFF};
 
@@ -106,15 +165,10 @@ class PorscheGt4 {
     int32_t minRelative = -65;
     int32_t maxRelative = 65;
 
-    // --- Internal Loops ---
     void controlLoop(std::stop_token st);
     void txLoop(std::stop_token st);
-    void dispatchLoop(std::stop_token st);
-
-    void queueTelemetry(std::function<void()> cb);
     void sendImmediate(const SimpleBLE::ByteArray& data);
     void sendReliable(const SimpleBLE::ByteArray& data);
-
     void setupHandshake();
     int32_t sweep_to_limit(int8_t speed, uint8_t power);
     void waitForMovement(int32_t target_absolute, int32_t tolerance = 4, int timeout_ms = 3000);
