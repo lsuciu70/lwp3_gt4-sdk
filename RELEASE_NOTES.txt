@@ -91,3 +91,21 @@ STABILITY FIXES:
 - Motor Protocol: Standardized on WriteDirectModeData (0x51) for high-speed 
   drive and StartSpeed (0x01) for calibration.
 - Persistent Connection: Discovery loop now waits for Hub button press.
+
+Version: 5.0.0 "The Hardened HAL"
+====================================
+
+This release fulfills the 'Tightening' pass for ADAS-ready operation.
+
+KEY IMPROVEMENTS:
+- Lock-Free Core: Telemetry and Command access now use atomic latches, 
+  eliminating mutex contention in the high-frequency control path.
+- Non-Blocking TX: Replaced sleep-based rate limiting with a 
+  high-frequency time-gate (Busy-wait/Yield). This ensures deterministic 
+  command dispatch precisely as the hardware window opens.
+- Robust Diagnostics: Latency profiling now uses Epsilon-matching to 
+  account for mechanical slack and includes automatic stale-packet cleanup.
+- ADAS Lead: Zero hidden control policy. Steering safety ramps are 
+  disabled by default.
+- BlueZ Hardening: Optimized disconnection sequence and detached callback 
+  threads to accommodate Experimental BlueZ backend jitter.

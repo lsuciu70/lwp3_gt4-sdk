@@ -1,5 +1,5 @@
 # LWP3-GT4-SDK (v4.9)
-### Deterministic Hardware Abstraction Layer for LEGO Porsche GT4 Autonomous Racing
+### High-Performance robotic HAL for LEGO Porsche GT4 e-Performance
 
 The **LWP3-GT4-SDK** is a high-performance C++20 library designed for researchers and developers building autonomous driving stacks. It transforms the LEGO Technic Porsche GT4 (42176) into a deterministic robotic platform.
 
@@ -11,11 +11,9 @@ The **LWP3-GT4-SDK** is a high-performance C++20 library designed for researcher
 ***
 
 ## 🚀 Key Features
-- **ADAS Ready:** Nanosecond-precision timestamps (`CLOCK_MONOTONIC_RAW`) for both RX and TX events.
-- **Asynchronous Pipeline:** Dedicated high-speed TX thread (66Hz) and lock-free Telemetry access.
-- **Pure HAL Philosophy:** No internal smoothing or PID control; the HAL provides raw, deterministic command relay.
-- **Mechanical Bodyguard:** Built-in hardware protection ramps and soft-margin enforcement to protect plastic gears.
-- **Persistent Connection:** Auto-discovery loop that waits for you to press the Hub button.
+- **Latency Tracking:** Real-time P50/P99 latency profiling.
+- **Lock-Free:** Atomic data latches for zero-contention state access.
+- **Deterministic:** Nanosecond timestamps for every physical event.
 
 ## 📦 Installation
 **Prerequisites:**
@@ -63,12 +61,6 @@ int main() {
     }
 }
 ```
-
-## 🛠 Architecture
-
-1. **Application Layer**: Owns the Kalman Filter, Path Planning, and PID control.  
-2. **HAL (This SDK)**: Provides a deterministic pipe to the hardware with gear protection.  
-1. **LWP3 Protocol**: Low-level byte communication with the LEGO Hub.
 
 ## ⚙️ Calibration Logic
 

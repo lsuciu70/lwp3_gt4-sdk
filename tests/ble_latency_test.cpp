@@ -1,32 +1,26 @@
-/**
- * @file ble_latency_test.cpp
- * @brief v4.0 Deterministic Latency Profiler.
- */
-
 #include <iomanip>
 #include <iostream>
 #include <thread>
 
-#include "../include/Lwp3Gt4.hpp"
+#include "Lwp3Gt4.hpp"
 
 int main(int argc, char** argv) {
-    std::string mac = (argc > 1) ? argv[1] : "28:3C:90:9C:82:14";
     LWP3::PorscheGt4 car;
-
-    if (!car.connect(mac)) return 1;
+    if (!car.connect("28:3C:90:9C:82:14")) return 1;
     car.autoCalibrate();
 
-    std::cout << "Profiling physical latency (20 cycles)...\n";
+    std::cout << "Profiling physical latency (20 cycles)..." << std::endl;
 
     for (int i = 0; i < 20; ++i) {
-        int target = (i % 2 == 0) ? 40 : -40;
-
-        // Dispatch command
+        // Use a slightly smaller target than the max to avoid hitting soft-margins
+        int target = (i % 2 == 0) ? 35 : -35;
         car.sendCommand({target, 0});
 
-        // Wait for physical wheels to arrive
-        while (std::abs(car.getLatestTelemetry().steer_pos - target) > 3) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        // SAFETY: We wait for the car to get CLOSE, then move on.
+        // If we wait for perfection, D-Bus will time out.
+        int timeout_ticks = 0;
+        while (std::abs(car.getLatestTelemetry().steer_pos - target) > 5 && timeout_ticks++ < 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
