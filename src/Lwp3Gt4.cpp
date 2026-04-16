@@ -1,6 +1,6 @@
 #include "Lwp3Gt4.hpp"
 
-#include <algorithm>  // Required for sorting samples
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -54,26 +54,11 @@ bool PorscheGt4::connect(std::string_view address) {
 void PorscheGt4::setupHandshake() {
     porsche.notify(SERVICE_UUID, CHAR_UUID, [this](SimpleBLE::ByteArray data) {
         auto* raw = reinterpret_cast<const uint8_t*>(data.data());
-
         if (data.size() >= 8 && raw[2] == 0x45 && raw[3] == PORT_STEER) {
-            _telemetryActive = true;
             int32_t val;
             std::memcpy(&val, &raw[4], sizeof(int32_t));
-
-            // Latency tracking: Measure time since last command sent
-            TimestampNs now = getNowNs();
-            TimestampNs lastTx = _lastTxTime.load();
-            if (lastTx > 0) {
-                std::lock_guard<std::mutex> lock(_statsMtx);
-                float lat_ms = static_cast<float>(now - lastTx) / 1'000'000.0f;
-                if (_latencySamples.size() >= 100) _latencySamples.erase(_latencySamples.begin());
-                _latencySamples.push_back(lat_ms);
-            }
-
-            _rawSteerPos.store(val);
-            _telemetryLatch.store({val - hardwareCenter, now});
+            updateTelemetry(val, getNowNs());
         }
-
         if (raw[2] == 0x04 && raw[4] == 0x02) {
             _virtualDrivePort.store(raw[3]);
         }
@@ -82,8 +67,7 @@ void PorscheGt4::setupHandshake() {
     porsche.write_command(SERVICE_UUID, CHAR_UUID,
                           {0x0A, 0x00, 0x41, PORT_STEER, 0x02, 0x01, 0x00, 0x00, 0x00, 0x01});
     std::this_thread::sleep_for(200ms);
-    porsche.write_command(SERVICE_UUID, CHAR_UUID,
-                          {0x06, 0x00, 0x61, 0x01, PORT_DRIVE_L, PORT_DRIVE_R});
+    porsche.write_command(SERVICE_UUID, CHAR_UUID, {0x06, 0x00, 0x61, 0x01, 0x32, 0x33});
     for (int i = 0; i < 20 && _virtualDrivePort.load() == 0xFF; ++i)
         std::this_thread::sleep_for(100ms);
 }
@@ -91,8 +75,16 @@ void PorscheGt4::setupHandshake() {
 void PorscheGt4::txLoop(std::stop_token st) {
     while (!st.stop_requested()) {
         std::unique_lock lock(_txMtx);
-        _txCv.wait_for(lock, 20ms, [&] { return _hasNewCmd.load() || st.stop_requested(); });
+        // Wait for command or timeout (Keepalive)
+        _txCv.wait_for(lock, 100ms, [&] { return _hasNewCmd.load() || st.stop_requested(); });
         if (st.stop_requested()) return;
+
+        TimestampNs now = getNowNs();
+
+        // Requirement 1: Non-blocking Rate Gate
+        if (now - _lastTxTime.load() < _txRateLimitNs) {
+            continue;  // Skip this tick, don't sleep the thread
+        }
 
         Command target = _latestCmd.load();
         _hasNewCmd.store(false);
@@ -104,8 +96,37 @@ void PorscheGt4::txLoop(std::stop_token st) {
             porsche.write_command(SERVICE_UUID, CHAR_UUID, buildDriveCmd(target.throttle));
             porsche.write_command(SERVICE_UUID, CHAR_UUID,
                                   buildSteerCmd(hardwareCenter + target.steer));
-            _lastTxTime.store(getNowNs());  // Mark TX time for latency profiling
+
+            _lastTxTime.store(now);
+
+            // Record for Epsilon Matching
+            std::lock_guard<std::mutex> sLock(_statsMtx);
+            _inflight.push_back({target.steer, now});
+            if (_inflight.size() > 20) _inflight.erase(_inflight.begin());
         } catch (...) {
+        }
+    }
+}
+
+void PorscheGt4::updateTelemetry(int32_t pos, TimestampNs now) {
+    int32_t rel_pos = pos - hardwareCenter;
+    _rawSteerPos.store(pos);
+    _telemetryLatch.store({rel_pos, now});
+    _telemetryActive = true;
+
+    // Requirement 4: Epsilon Matching Rule
+    // Match current position against the history of targets
+    std::lock_guard<std::mutex> lock(_statsMtx);
+    for (auto it = _inflight.begin(); it != _inflight.end();) {
+        if (std::abs(rel_pos - it->steer_target) < _epsilon) {
+            float lat_ms = static_cast<float>(now - it->tx_time) / 1'000'000.0f;
+            if (_latencySamples.size() >= 100) _latencySamples.erase(_latencySamples.begin());
+            _latencySamples.push_back(lat_ms);
+            it = _inflight.erase(it);  // Match found, remove from inflight
+        } else if (now - it->tx_time > 500'000'000) {
+            it = _inflight.erase(it);  // Clean stale commands (>500ms)
+        } else {
+            ++it;
         }
     }
 }
@@ -137,7 +158,7 @@ SimpleBLE::ByteArray PorscheGt4::buildDriveCmd(int8_t speed) {
 }
 
 SimpleBLE::ByteArray PorscheGt4::buildSteerCmd(int32_t abs_angle) {
-    std::array<uint8_t, 14> buf = {0x0E, 0x00, 0x81, PORT_STEER, 0x11, 0x0D};
+    std::array<uint8_t, 14> buf = {0x0E, 0x00, 0x81, 0x34, 0x11, 0x0D};
     std::memcpy(&buf[6], &abs_angle, sizeof(int32_t));
     buf[10] = 50;
     buf[11] = 100;
@@ -163,10 +184,9 @@ bool PorscheGt4::autoCalibrate() {
 
 int32_t PorscheGt4::sweep_to_limit(int8_t speed) {
     porsche.write_command(SERVICE_UUID, CHAR_UUID,
-                          {0x07, 0x00, 0x81, PORT_STEER, 0x11, 0x01, static_cast<uint8_t>(speed)});
+                          {0x07, 0x00, 0x81, 0x34, 0x11, 0x01, static_cast<uint8_t>(speed)});
     std::this_thread::sleep_for(1s);
-    porsche.write_command(SERVICE_UUID, CHAR_UUID,
-                          {0x07, 0x00, 0x81, PORT_STEER, 0x11, 0x01, 0x00});
+    porsche.write_command(SERVICE_UUID, CHAR_UUID, {0x07, 0x00, 0x81, 0x34, 0x11, 0x01, 0x00});
     return _rawSteerPos.load();
 }
 

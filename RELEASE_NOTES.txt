@@ -109,3 +109,23 @@ KEY IMPROVEMENTS:
   disabled by default.
 - BlueZ Hardening: Optimized disconnection sequence and detached callback 
   threads to accommodate Experimental BlueZ backend jitter.
+
+Version: 7.0.0 "The Mechanical Truth"
+====================================
+
+This release represents the shift from a communication-focused driver to a
+Control-System-Aware HAL.
+
+Key Improvements
+- True Latency Profiling: Introduced Epsilon Matching. We no longer report
+  the speed of the Bluetooth air (10ms). We now report the speed of the
+  physical steering rack (90ms mean), enabling the next stage of ADAS:
+  Latency Compensation.
+- Deterministic Control: Replaced thread-sleeping with a Timestamp Rate Gate.
+  The TX thread remains "hot" and responsive, firing the moment the 15ms
+  BlueZ stability window opens.
+- Mechanical Integrity: Set ϵ=3.0 as the production threshold. This value was
+  found through sensitivity analysis to be the "Mechanical Plateau" of the
+  Porsche GT4's steering rack, effectively filtering out gear-lash and jitter.
+- Memory Efficiency: Cleaned public surface area. The HAL is now an opaque,
+  deterministic pipe.

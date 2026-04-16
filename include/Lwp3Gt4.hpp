@@ -1,3 +1,13 @@
+/**
+ * @file Lwp3Gt4.hpp
+ * @brief High-Performance HAL for Porsche GT4 (Lego Move Hub 88019).
+ * * Target Environment: Ubuntu 24.04 LTS (HP OmniBook 7 AeroNGAI 13)
+ * Protocol: LEGO Wireless Protocol v3 (LWP3) over BLE.
+ * * Version 7.0: Implements "The Mechanical Truth" - a deterministic
+ * control loop with epsilon-matched latency profiling and non-blocking
+ * transmission gates.
+ */
+
 #pragma once
 #include <simpleble/SimpleBLE.h>
 
@@ -13,20 +23,37 @@ namespace LWP3 {
 
 using TimestampNs = uint64_t;
 
+/**
+ * @brief Represents a single control frame sent to the vehicle.
+ */
 struct Command {
-    int32_t steer = 0;
-    int32_t throttle = 0;
+    int32_t steer;     ///< Steering angle in degrees (-100 to 100)
+    int32_t throttle;  ///< Motor power percentage (-100 to 100)
 };
 
+/**
+ * @brief Represents the latest state received from the vehicle hardware.
+ */
 struct Telemetry {
-    int32_t steer_pos = 0;
-    TimestampNs timestamp_ns = 0;
+    int32_t steer_pos;         ///< Absolute steering position relative to calibrated center.
+    TimestampNs timestamp_ns;  ///< Monotonic timestamp (CLOCK_MONOTONIC_RAW) of ingestion.
 };
 
+/**
+ * @brief High-fidelity latency metrics for ADAS estimation.
+ */
 struct LatencyStats {
-    float mean_ms;
-    float p50_ms;
-    float p99_ms;
+    float mean_ms;  ///< Average time between Command TX and physical Epsilon-match.
+    float p50_ms;   ///< Median response time.
+    float p99_ms;   ///< Worst-case jitter boundary (99th percentile).
+};
+
+/**
+ * @brief Tracking structure for inflight commands used in latency matching.
+ */
+struct TxRecord {
+    int32_t steer_target;  ///< The target position we are waiting for the motor to reach.
+    TimestampNs tx_time;   ///< Timestamp when the packet was sent to the D-Bus.
 };
 
 class PorscheGt4 {
@@ -34,19 +61,53 @@ class PorscheGt4 {
     PorscheGt4();
     ~PorscheGt4();
 
+    /**
+     * @brief Establishes a BLE connection and initializes the LWP3 handshake.
+     * @param address The MAC address of the Move Hub.
+     * @return true if connected and virtual ports are established, false otherwise.
+     */
     bool connect(std::string_view address);
+
+    /**
+     * @brief Disconnects the peripheral and stops the background TX thread.
+     */
     void disconnect();
+
+    /**
+     * @brief Performs physical discovery of the steering rack's mechanical limits.
+     * Finds the hardware center and sets the soft-stop boundaries.
+     * @return true if calibration succeeded.
+     */
     bool autoCalibrate();
 
+    /**
+     * @brief Dispatches a control command using "Latest Wins" atomic semantics.
+     * This function is non-blocking and thread-safe.
+     * @param cmd The target steering and throttle values.
+     */
     void sendCommand(const Command& cmd) noexcept;
+
+    /**
+     * @brief Retrieves the most recent telemetry state in a lock-free manner.
+     * @return A Telemetry struct containing the latest steering position.
+     */
     Telemetry getLatestTelemetry() const noexcept;
 
-    /** @brief Calculates Mean, P50, and P99 latency from recent samples. */
+    /**
+     * @brief Calculates real-time latency statistics using Epsilon-Matching.
+     * This provides a model of physical system response, not just transport time.
+     * @return Statistical report of system lag.
+     */
     LatencyStats getLatencyStats();
 
+    /**
+     * @brief Checks if the system is ready for ADAS-level control.
+     * Requires valid calibration and established virtual drive ports.
+     */
     bool isReady() const noexcept;
 
    private:
+    // Core BLE Infrastructure
     mutable SimpleBLE::Peripheral porsche;
     std::jthread _txThread;
     std::atomic<bool> _running{false};
@@ -54,26 +115,48 @@ class PorscheGt4 {
     std::condition_variable _txCv;
     std::mutex _txMtx;
 
+    // Control State (Atomic Latest Semantics)
     std::atomic<Command> _latestCmd{Command{0, 0}};
     std::atomic<bool> _hasNewCmd{false};
     std::atomic<Telemetry> _telemetryLatch{Telemetry{}};
 
+    // Internal Telemetry State
     std::atomic<int32_t> _rawSteerPos{0};
     std::atomic<bool> _telemetryActive{false};
     std::atomic<uint8_t> _virtualDrivePort{0xFF};
 
-    // Profiling members
+    // Requirement 4: Epsilon Latency Matching
+    // Logic: Only records latency if |current_pos - target_pos| < _epsilon.
     std::mutex _statsMtx;
+    std::vector<TxRecord> _inflight;
     std::vector<float> _latencySamples;
-    std::atomic<TimestampNs> _lastTxTime{0};
+    const float _epsilon = 3.0f;  // Degrees of mechanical play/slop.
 
+    // Requirement 1: Non-blocking Rate Gate
+    // Logic: Ensures D-Bus stability without sleeping the TX thread.
+    std::atomic<TimestampNs> _lastTxTime{0};
+    const uint64_t _txRateLimitNs = 15'000'000;  // 15ms safety gate.
+
+    /** @brief The high-priority TX loop handling dual-packet LWP3 dispatches. */
     void txLoop(std::stop_token st);
+
+    /** @brief Handles Port 52 subscription and Virtual Drive Port (0x61) creation. */
     void setupHandshake();
+
+    /** @brief Ingests raw BLE notifications and performs epsilon-matching. */
+    void updateTelemetry(int32_t pos, TimestampNs now);
+
+    /** @brief Utility for high-precision monotonic timing. */
     TimestampNs getNowNs() const;
 
+    // Packet Builders
     SimpleBLE::ByteArray buildSteerCmd(int32_t abs_angle);
     SimpleBLE::ByteArray buildDriveCmd(int8_t speed);
+
+    /** @brief Moves the steering rack until a physical stall is detected. */
     int32_t sweep_to_limit(int8_t speed);
+
+    /** @brief Blocks until a command is written to ensure calibration stability. */
     void sendReliable(const SimpleBLE::ByteArray& data);
 
     int32_t hardwareCenter = 0;
